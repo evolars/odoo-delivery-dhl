@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_delivery_carrier_form_dhl" model="ir.ui.view">
+        <field name="name">delivery.carrier.form.dhl.express</field>
+        <field name="model">delivery.carrier</field>
+        <field name="inherit_id" ref="delivery.view_delivery_carrier_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="DHL Express" name="dhl_express"
+                      invisible="delivery_type != 'dhl_express'">
+                    <group>
+                        <group string="Credenciais">
+                            <field name="dhl_api_key" password="True"/>
+                            <field name="dhl_api_secret" password="True"/>
+                            <field name="dhl_account_number"/>
+                            <button name="action_dhl_test_connection" type="object"
+                                    string="Testar conexão" class="btn-link ps-0"
+                                    icon="fa-plug" colspan="2"
+                                    invisible="dhl_simulation"/>
+                            <div colspan="2" class="text-muted">
+                                Fora de produção as chamadas vão para o sandbox, que
+                                tem limite de 500 por dia.
+                            </div>
+                        </group>
+                        <group string="Serviço">
+                            <field name="dhl_product_code" placeholder="vazio = mais barato"/>
+                            <field name="dhl_incoterm"/>
+                            <field name="dhl_default_package_type_id"/>
+                            <field name="dhl_lead_days"/>
+                        </group>
+                    </group>
+                    <group>
+                        <div colspan="2" class="alert alert-info" role="alert"
+                             invisible="dhl_incoterm != 'DAP'">
+                            Com <b>DAP</b>, o destinatário paga imposto de importação e
+                            desembaraço na entrega. Isso <b>precisa</b> aparecer no
+                            checkout: sem aviso, o comprador é surpreendido e recusa o
+                            pacote, que volta por conta do remetente.
+                        </div>
+                    </group>
+                    <group string="Antes da conta existir">
+                        <field name="dhl_simulation"/>
+                        <field name="dhl_simulation_price" widget="monetary"
+                               invisible="not dhl_simulation"/>
+                    </group>
+                </page>
+            </xpath>
+        </field>
+    </record>
+
+</odoo>
