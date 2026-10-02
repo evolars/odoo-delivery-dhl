@@ -111,6 +111,12 @@ class DeliveryCarrier(models.Model):
              "exercitar o checkout antes de a conta existir. Nunca cria envio.",
     )
     dhl_simulation_price = fields.Float(string="Preço simulado", default=180.0)
+    dhl_require_nfe = fields.Boolean(
+        string="Exigir NF-e autorizada", default=True,
+        help="Remetente brasileiro com Inscrição Estadual só exporta com NF-e: a DHL "
+             "Brasil exige a nota no despacho, e a Receita cruza a nota com a fatura "
+             "comercial. Ligado, a entrega não é despachada sem NF-e autorizada na venda.",
+    )
 
     # ------------------------------------------------------------------ #
     # Infraestrutura                                                      #
@@ -459,6 +465,7 @@ class DeliveryCarrier(models.Model):
                 ))
             picking.dhl_dispatch_confirmation = response.get("dispatchConfirmationNumber")
             self._dhl_attach_documents(picking, response, tracking)
+            picking.dhl_tracking_status = False
             resultado.append({
                 "exact_price": self._dhl_price_in_company_currency(produto, picking.company_id),
                 "tracking_number": tracking,
@@ -521,8 +528,20 @@ class DeliveryCarrier(models.Model):
             volume["customerReferences"] = [{"value": referencia, "typeCode": "CU"}]
             volumes.append(volume)
 
-        imagens = [{"typeCode": "label",
-                    "templateName": self.dhl_label_template or "ECOM26_84_001"}]
+        nfe = self._dhl_nfe(picking) if internacional else False
+        if internacional and not nfe and self._dhl_requires_nfe(remetente, picking.company_id):
+            raise DhlError(_(
+                "Emita a NF-e de exportação da venda %s antes de despachar: a DHL Brasil "
+                "exige a nota de quem tem Inscrição Estadual, e a Receita cruza a nota com "
+                "a fatura comercial.", picking.sale_id.name or picking.name,
+            ))
+
+        etiqueta = {"typeCode": "label",
+                    "templateName": self.dhl_label_template or "ECOM26_84_001"}
+        if nfe:
+            # impressa na etiqueta: quem confere o pacote acha a nota sem abrir nada
+            etiqueta["labelCustomerDataText"] = "NF-e %s" % nfe["key"]
+        imagens = [etiqueta]
         if internacional and self.dhl_commercial_invoice:
             imagens.append({"typeCode": "invoice", "isRequested": True,
                             "invoiceType": "commercial"})
@@ -538,7 +557,7 @@ class DeliveryCarrier(models.Model):
             content["declaredValue"] = round(self._dhl_commodities_value(pacotes), 2)
             content["declaredValueCurrency"] = moeda
             content["exportDeclaration"] = self._dhl_export_declaration(
-                picking, pacotes, destinatario, referencia)
+                picking, pacotes, destinatario, referencia, nfe)
 
         payload = {
             "plannedShippingDateAndTime": self._dhl_planned_date(remetente),
@@ -566,7 +585,7 @@ class DeliveryCarrier(models.Model):
         descricao = ", ".join(nomes).strip() or self.env._("Mercadorias")
         return descricao[:MAX_CONTENT_DESCRIPTION]
 
-    def _dhl_export_declaration(self, picking, pacotes, destinatario, referencia):
+    def _dhl_export_declaration(self, picking, pacotes, destinatario, referencia, nfe=False):
         """Declaração aduaneira. Cada item precisa de código HS, valor unitário e
         o peso total da linha (a DHL não multiplica pela quantidade)."""
         _ = self.env._
@@ -608,17 +627,28 @@ class DeliveryCarrier(models.Model):
             "exportReasonType": "permanent",
             "shipmentType": "commercial",
         }
-        nfe = self._dhl_nfe(picking)
         if nfe:
-            # A DHL Brasil exige a NF-e de exportação no despacho simplificado,
-            # mas a API não tem campo para ela: a chave vai nas observações e o
-            # número, como número da fatura.
+            # A fatura comercial tem de corresponder à NF-e de exportação: mesmo
+            # número e data. A API não tem campo para a chave; ela vai nas
+            # observações da declaração e impressa na etiqueta.
             declaracao["invoice"]["number"] = nfe["number"]
+            declaracao["invoice"]["date"] = nfe["date"]
             declaracao["remarks"] = [{"value": "NF-e %s" % nfe["key"]}]
         # DAP/DDP: o lugar do incoterm é o destino
         if destinatario.city:
             declaracao["placeOfIncoterm"] = destinatario.city[:256]
         return declaracao
+
+    def _dhl_requires_nfe(self, remetente, company):
+        """Exportador brasileiro com IE precisa de NF-e. Sem a localização fiscal
+        (OCA) não há como emitir nem checar a nota pelo Odoo."""
+        if not self.dhl_require_nfe or remetente.country_id.code != "BR":
+            return False
+        if "document_key" not in self.env["account.move"]._fields:
+            return False
+        parceiro = company.partner_id
+        ie = tax_id(getattr(parceiro, "l10n_br_ie_code", False))
+        return bool(ie) and ie != "ISENTO"
 
     def _dhl_nfe(self, picking):
         """A NF-e autorizada da venda, se a localização fiscal (OCA) estiver
@@ -633,11 +663,32 @@ class DeliveryCarrier(models.Model):
             if "state_edoc" in fatura._fields and fatura.state_edoc != "autorizada":
                 continue
             numero = "".join(c for c in (fatura.document_number or "") if c.isdigit())
-            return {"key": chave, "number": (numero or chave[25:34])[:MAX_REFERENCE]}
+            emissao = getattr(fatura, "document_date", False) or fatura.invoice_date
+            return {
+                "key": chave,
+                "number": (numero or chave[25:34])[:MAX_REFERENCE],
+                "date": fields.Date.to_date(emissao).isoformat() if emissao
+                else fields.Date.context_today(self).isoformat(),
+                "move": fatura,
+            }
         return False
 
+    def _dhl_attach_nfe(self, picking, nfe):
+        """DANFE e XML autorizados vão junto da etiqueta: o DANFE acompanha o
+        pacote, e o XML é o que a DHL Brasil importa quando pede a nota."""
+        fatura = nfe["move"]
+        anexos = self.env["ir.attachment"]
+        for campo in ("file_report_id", "authorization_file_id"):
+            arquivo = getattr(fatura, campo, False) if campo in fatura._fields else False
+            if arquivo:
+                anexos |= arquivo.sudo().copy({
+                    "res_model": "stock.picking", "res_id": picking.id,
+                })
+        return anexos
+
     def _dhl_attach_documents(self, picking, response, tracking):
-        """Guarda etiqueta e fatura comercial, que vêm em base64, junto à entrega."""
+        """Guarda etiqueta e fatura comercial, que vêm em base64, junto à entrega,
+        com o DANFE e o XML da NF-e quando houver."""
         anexos = self.env["ir.attachment"]
         for documento in response.get("documents") or []:
             conteudo = documento.get("content")
@@ -655,9 +706,15 @@ class DeliveryCarrier(models.Model):
                 "res_model": "stock.picking",
                 "res_id": picking.id,
             })
+        nfe = self._dhl_nfe(picking)
+        if nfe:
+            anexos |= self._dhl_attach_nfe(picking, nfe)
         if anexos:
             picking.message_post(
-                body=self.env._("Documentos da DHL para o envio %s.", tracking),
+                body=self.env._(
+                    "Documentos do envio DHL %s: imprima a etiqueta e a fatura comercial "
+                    "e mande o DANFE junto do pacote.", tracking,
+                ) if nfe else self.env._("Documentos do envio DHL %s.", tracking),
                 attachment_ids=anexos.ids,
             )
 
@@ -674,25 +731,40 @@ class DeliveryCarrier(models.Model):
         )
 
     def dhl_express_cancel_shipment(self, pickings):
-        """A MyDHL API não cancela o conhecimento, só a coleta agendada.
+        """Cancela o envio pelo que a DHL permite.
 
-        Cancela a coleta, se houver, e deixa registrado o que falta fazer: o
-        conhecimento deixa de valer se o pacote não for entregue à DHL.
+        A MyDHL API não anula conhecimento, e nem precisa: pelos termos da API,
+        emitir o conhecimento não é contrato de transporte, que só nasce quando o
+        pacote é entregue ou coletado. O que os termos permitem cobrar é a coleta
+        agendada sem pacote para entregar, e essa a API cancela. Depois disso, as etiquetas são marcadas como canceladas para
+        ninguém imprimir, e a entrega pode ser despachada de novo.
         """
         self.ensure_one()
         for picking in pickings:
-            if picking.dhl_dispatch_confirmation:
+            numero = picking.carrier_tracking_ref
+            coleta = picking.dhl_dispatch_confirmation
+            if coleta:
                 self._dhl_get_client().cancel_pickup(
-                    picking.dhl_dispatch_confirmation,
-                    requestor=self.env.user.name or "Odoo",
-                    reason="Envio cancelado",
+                    coleta, requestor=self.env.user.name or "Odoo", reason="Envio cancelado",
                 )
                 picking.dhl_dispatch_confirmation = False
-            picking.message_post(body=self.env._(
-                "A API da DHL não cancela o conhecimento %s: não entregue este pacote "
-                "à DHL e confira no MyDHL. A coleta agendada, se havia, foi cancelada.",
-                picking.carrier_tracking_ref,
+            etiquetas = self.env["ir.attachment"].search([
+                ("res_model", "=", "stock.picking"), ("res_id", "=", picking.id),
+                ("name", "like", "%s-%s-" % (self._get_delivery_label_prefix(), numero)),
+            ]) if numero else self.env["ir.attachment"]
+            for etiqueta in etiquetas:
+                etiqueta.name = "CANCELADA-%s" % etiqueta.name
+            picking.dhl_tracking_status = self.env._("Cancelado")
+            partes = [self.env._("Envio DHL %s cancelado.", numero)]
+            if coleta:
+                partes.append(self.env._("Coleta %s cancelada na DHL.", coleta))
+            if etiquetas:
+                partes.append(self.env._("Etiqueta marcada como CANCELADA: não imprima."))
+            partes.append(self.env._(
+                "Sem o pacote entregue à DHL o conhecimento não vira contrato de "
+                "transporte. Para despachar de novo, use Enviar para a transportadora."
             ))
+            picking.message_post(body=" ".join(partes))
         return True
 
     def _dhl_express_get_default_custom_package_code(self):

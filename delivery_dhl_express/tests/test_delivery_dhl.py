@@ -381,15 +381,71 @@ class TestDhlShipping(DhlCarrierCase):
             "isRequested": True, "closeTime": "17:30", "location": "Recepção"})
         self.assertEqual(picking.dhl_dispatch_confirmation, "PRG261002000001")
 
-    def test_cancel_cancels_the_pickup_and_explains_the_waybill(self):
+    def test_cancel_cancels_the_pickup_and_voids_the_label(self):
         self.carrier.dhl_request_pickup = True
         picking = self._picking()
         self._ship(picking, dict(SHIPMENT, dispatchConfirmationNumber="PRG1"))
+        picking.carrier_tracking_ref = "1234567890"
         with patch.object(requests, "request", return_value=FakeResponse(payload={})) as call:
-            self.carrier.dhl_express_cancel_shipment(picking)
+            picking.cancel_shipment()
         self.assertTrue(call.call_args[0][1].endswith("/pickups/PRG1"))
         self.assertFalse(picking.dhl_dispatch_confirmation)
-        self.assertIn("MyDHL", picking.message_ids[0].body)
+        self.assertFalse(picking.carrier_tracking_ref, "pode ser despachada de novo")
+        self.assertEqual(picking.dhl_tracking_status, "Cancelado")
+        etiqueta = self.env["ir.attachment"].search([
+            ("res_model", "=", "stock.picking"), ("res_id", "=", picking.id),
+            ("name", "like", "-label."),
+        ])
+        self.assertTrue(etiqueta.name.startswith("CANCELADA-"), "ninguém imprime por engano")
+        mensagens = " ".join(picking.message_ids.mapped("body"))
+        self.assertIn("Coleta PRG1 cancelada", mensagens)
+
+    def test_cancel_without_pickup_makes_no_call(self):
+        picking = self._picking()
+        self._ship(picking)
+        picking.carrier_tracking_ref = "1234567890"
+        with patch.object(requests, "request") as call:
+            picking.cancel_shipment()
+        call.assert_not_called()
+        self.assertFalse(picking.carrier_tracking_ref)
+
+    # --- NF-e de exportação ------------------------------------------------- #
+
+    NFE = {"key": "42261066903932000152550010000001231000001234", "number": "123",
+           "date": "2026-10-02"}
+
+    def test_exporter_with_ie_cannot_ship_without_nfe(self):
+        Carrier = self.env.registry["delivery.carrier"]
+        picking = self._picking()
+        with patch.object(Carrier, "_dhl_requires_nfe", return_value=True), \
+                patch.object(Carrier, "_dhl_nfe", return_value=False):
+            with patch.object(requests, "request", side_effect=[
+                FakeResponse(payload={"products": [product("P", 320.0)]}),
+            ]) as call:
+                with self.assertRaises(DhlError) as caught:
+                    self.carrier.send_shipping(picking)
+        self.assertIn("NF-e", str(caught.exception))
+        self.assertEqual(call.call_count, 1, "só a cotação: o envio nem é criado")
+
+    def test_nfe_goes_on_label_invoice_and_remarks(self):
+        Carrier = self.env.registry["delivery.carrier"]
+        nfe = dict(self.NFE, move=self.env["account.move"])
+        picking = self._picking()
+        with patch.object(Carrier, "_dhl_nfe", return_value=nfe):
+            _result, call = self._ship(picking)
+        corpo = call.call_args_list[1][1]["json"]
+        etiqueta = corpo["outputImageProperties"]["imageOptions"][0]
+        self.assertEqual(etiqueta["labelCustomerDataText"], "NF-e %s" % self.NFE["key"])
+        declaracao = corpo["content"]["exportDeclaration"]
+        self.assertEqual(declaracao["invoice"], {"number": "123", "date": "2026-10-02"},
+                         "a fatura comercial corresponde à NF-e")
+        self.assertEqual(declaracao["remarks"], [{"value": "NF-e %s" % self.NFE["key"]}])
+        self.assertIn("DANFE", picking.message_ids[0].body)
+
+    def test_requirement_only_applies_to_brazilian_exporter_with_ie(self):
+        remetente = self.env.company.partner_id
+        self.carrier.dhl_require_nfe = False
+        self.assertFalse(self.carrier._dhl_requires_nfe(remetente, self.env.company))
 
     def test_tracking_link_and_refresh(self):
         picking = self._picking()

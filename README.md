@@ -67,6 +67,7 @@ Inventário → Configuração → Métodos de Entrega → novo método, provedo
 | Formato da etiqueta | 8 × 4 pol (térmica), A6 ou A4 |
 | Fatura comercial pela DHL | pede o PDF da commercial invoice junto com a etiqueta |
 | Pedir coleta | agenda a coleta ao criar o envio (horário limite e local) |
+| Exigir NF-e autorizada | exportador brasileiro com IE não despacha sem NF-e (ligado por padrão) |
 
 ---
 
@@ -116,19 +117,34 @@ entrega: dá o produto (obrigatório no envio) e o custo real. O payload leva:
 * declaração aduaneira: uma linha por produto com código HS (do produto, ou o padrão do método),
   preço **unitário**, quantidade em `PCS`, país de fabricação e peso **total da linha** (a DHL
   não multiplica); motivo `sale`/`permanent`; `placeOfIncoterm` é a cidade de destino;
-* com NF-e autorizada na venda (localização fiscal OCA), o número dela vira o número da fatura e
-  a chave vai nas observações (`remarks`). **A API não tem campo próprio para NF-e: confirme com
-  a DHL Brasil** como ela quer receber.
+* a NF-e de exportação (ver abaixo).
 
-A etiqueta (e a fatura comercial, se pedida) volta em PDF base64 e é anexada à entrega. Não há
-reimpressão de etiqueta pela API.
+A etiqueta (e a fatura comercial, se pedida) volta em PDF base64 e é anexada à entrega, junto
+com o DANFE e o XML da NF-e. Não há reimpressão de etiqueta pela API.
+
+### NF-e de exportação
+
+Pelo manual do MyDHL+ da DHL Brasil, empresa com Inscrição Estadual só envia produto com nota
+fiscal (sem nota, só isento de IE ou pessoa física), e a Receita cruza a NF-e com a fatura
+comercial. Com *Exigir NF-e autorizada* (padrão), remetente brasileiro com IE **não despacha
+sem NF-e autorizada na venda** (localização fiscal OCA): a validação da entrega mostra o aviso.
+
+A MyDHL API não tem campo de NF-e (conferido até a 3.3.2: o único tratamento brasileiro é o
+`CNP` no remetente). A nota vai por todos os meios que a API oferece:
+
+* chave impressa na etiqueta (`imageOptions[label].labelCustomerDataText`);
+* fatura comercial com o **número e a data da NF-e** (`exportDeclaration.invoice`);
+* chave nas observações da declaração (`exportDeclaration.remarks`);
+* DANFE e XML autorizados anexados à entrega, para o DANFE seguir com o pacote.
 
 **Rastreio**: link `https://www.dhl.com/br-pt/home/rastreamento.html?tracking-id=<AWB>&submit=1`
 no portal; botão *Atualizar rastreio* registra o último evento na entrega.
 
-**Cancelamento**: a MyDHL API **não cancela conhecimento**, só coleta
-(`DELETE /pickups/{número}`). O módulo cancela a coleta agendada, se houver, e registra na
-entrega que o pacote não deve ser entregue à DHL — confira no MyDHL.
+**Cancelamento**: a MyDHL API não anula conhecimento, e nem precisa. Pelos termos da API,
+emitir o conhecimento não é contrato de transporte, que só nasce quando o pacote é entregue ou
+coletado; o que os termos permitem cobrar é a coleta agendada sem pacote. Ao cancelar o envio na
+entrega, o módulo cancela a coleta na DHL (`DELETE /pickups/{número}`), marca a etiqueta como
+**CANCELADA** para ninguém imprimir e libera a entrega para ser despachada de novo.
 
 ### Exportação a partir do Brasil
 
@@ -154,16 +170,17 @@ docker run --rm --network <rede> \
   --stop-after-init --without-demo=all --http-port 8099
 ```
 
-31 testes, nenhum tocando a rede: Basic Auth e `x-version`, formato de erro, cotação (payload,
+35 testes, nenhum tocando a rede: Basic Auth e `x-version`, formato de erro, cotação (payload,
 fuso da data, moeda faturada e conversão, produto fixo e fallback, aviso DAP, só internacional,
 falhas sem exceção, simulação), teste de conexão, envio (payload completo, CNPJ, declaração,
-documentos anexados, telefone e HS obrigatórios, coleta), cancelamento da coleta e rastreio.
+documentos anexados, telefone e HS obrigatórios, coleta), NF-e (obrigatória com IE, na etiqueta,
+na fatura comercial e nas observações), cancelamento (coleta, etiqueta, novo despacho) e rastreio.
 
 ---
 
 ## Estado
 
 Escrito contra a especificação OpenAPI oficial da MyDHL API **3.3.2** (06/09/2026), conferida
-em 02/10/2026. **Ainda não validado contra a API real** — falta a conta. Pontos a confirmar na
-primeira chamada: códigos de produto da conta e da rota, onde a DHL Brasil quer a NF-e, e se a
-validação de endereço aceita o formato de rua brasileiro.
+em 02/10/2026. **Ainda não validado contra a API real** — falta a conta. Pontos a observar na
+primeira chamada: códigos de produto da conta e da rota, e se a validação de endereço aceita o
+formato de rua brasileiro.

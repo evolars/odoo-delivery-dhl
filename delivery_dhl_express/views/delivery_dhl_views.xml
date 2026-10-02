@@ -30,6 +30,7 @@
                             <field name="dhl_international_only"/>
                             <field name="dhl_lead_days"/>
                             <field name="dhl_default_hs_code" placeholder="490199"/>
+                            <field name="dhl_require_nfe"/>
                         </group>
                     </group>
                     <group>
