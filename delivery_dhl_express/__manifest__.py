@@ -1,23 +1,23 @@
 {
     "name": "DHL Express - Frete Internacional",
-    "version": "17.0.1.0.0",
+    "version": "18.0.1.0.0",
     "category": "Inventory/Delivery",
-    "summary": "Cotação, envio e rastreamento pela MyDHL API",
+    "summary": "Cotação, envio, etiqueta e rastreamento pela MyDHL API",
     "description": """
-Conector da DHL Express para o Odoo 17, sobre a MyDHL API.
+Conector da DHL Express para o Odoo 18, sobre a MyDHL API (3.3.2).
 
 A Odoo mantém um conector oficial de DHL, mas ele vive no Enterprise: no
-repositório `odoo/odoo`, branch 17.0, o único conector de transportadora que
-existe em Community é o `delivery_mondialrelay`. Por isso este módulo **não se
-chama `delivery_dhl`** — numa base com Enterprise o nome colidiria.
+repositório `odoo/odoo` o único conector de transportadora que existe em
+Community é o `delivery_mondialrelay`. Por isso este módulo **não se chama
+`delivery_dhl`**: numa base com Enterprise o nome colidiria.
 
-Cobre cotação, criação de envio com etiqueta e declaração aduaneira, e
-rastreamento pelo portal do cliente.
+Cobre cotação, criação de envio com etiqueta, fatura comercial e declaração
+aduaneira, coleta opcional e rastreamento.
 
 **Incoterm.** O padrão é `DAP`: o destinatário paga imposto de importação e
-desembaraço na entrega. Quando é esse o caso, a cotação devolve um aviso para
-o checkout mostrar — sem isso o comprador é surpreendido na entrega e recusa o
-pacote, que volta por conta do remetente.
+desembaraço na entrega. O checkout do Odoo 18 não mostra o aviso da cotação:
+ponha o aviso na descrição do método no site, ou o comprador é surpreendido
+na entrega e recusa o pacote, que volta por conta do remetente.
 
 Traz um **modo simulação** que cota por um valor fixo local, para o checkout
 poder ser exercitado antes de a conta DHL existir. Despachar fica bloqueado.

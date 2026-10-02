@@ -1,12 +1,14 @@
-# DHL Express para Odoo 17
+# DHL Express para Odoo 18
 
 Conector da [DHL Express](https://www.dhl.com) sobre a MyDHL API: cotação no carrinho, criação
-do envio com etiqueta e declaração aduaneira, e rastreamento pelo portal do cliente.
+do envio com etiqueta, fatura comercial e declaração aduaneira, coleta opcional e rastreamento.
+
+Branches: `18.0` (este) e `17.0` (versão anterior, nunca validada contra a API real).
 
 ## Por que não se chama `delivery_dhl`
 
 A Odoo mantém um conector oficial de DHL, mas ele vive no **Enterprise**. No repositório
-`odoo/odoo`, branch `17.0`, o único conector de transportadora que existe em Community é o
+`odoo/odoo` o único conector de transportadora que existe em Community é o
 `delivery_mondialrelay`. Numa base com Enterprise instalado, um módulo chamado `delivery_dhl`
 colidiria com o oficial — daí o nome `delivery_dhl_express`.
 
@@ -14,7 +16,8 @@ colidiria com o oficial — daí o nome `delivery_dhl_express`.
 
 ## Instalação
 
-Depende de `stock_delivery` e da biblioteca `requests`.
+Depende de `stock_delivery` e da biblioteca `requests`. Pelo Doodba (é assim que entra na
+imagem `odoo-template`):
 
 ```yaml
 # custom/src/repos.yaml
@@ -30,12 +33,15 @@ Depende de `stock_delivery` e da biblioteca `requests`.
 
 ## Credenciais
 
-Exige **conta ativa na DHL Express**. O consultor fornece o acesso à MyDHL API e o cadastro no
-portal do desenvolvedor devolve dois e-mails, normalmente no dia útil seguinte: um liberando o
-**teste** e outro a **produção**. O ambiente de teste tem limite de **500 chamadas por dia**.
+Exige **conta ativa na DHL Express** (conta de exportação). Com ela, o cadastro no
+[portal do desenvolvedor](https://developer.dhl.com/api-reference/dhl-express-mydhl-api)
+pedindo acesso à *MyDHL API* devolve a **chave e o segredo da API**, normalmente em dois e-mails:
+um liberando o **teste** e outro a **produção**. O ambiente de teste tem limite de **500
+chamadas por dia** e só rastreia números de exemplo da DHL, não os envios criados nele.
 
 O ambiente segue o campo *Ambiente* do método de entrega — fora de produção, as chamadas vão
-para `/mydhlapi/test`.
+para `/mydhlapi/test`. **Testar conexão** confere a credencial e se a DHL faz coleta no endereço
+de saída (`GET /address-validate`), sem criar nada.
 
 ### Antes de a conta existir
 
@@ -44,14 +50,34 @@ fica bloqueado.
 
 ---
 
-## Incoterm: leia isto
+## Configuração
+
+Inventário → Configuração → Métodos de Entrega → novo método, provedor **DHL Express**:
+
+| Campo | O que é |
+|---|---|
+| Chave / Segredo da API | Basic Auth da MyDHL API |
+| Número da Conta DHL | a conta de exportação (`shipper`), obrigatória para criar envio |
+| Código do Produto | vazio cota o mais barato; preenchido fixa o serviço (ex.: `P`) |
+| Incoterm | DAP (padrão) ou DDP |
+| Só internacional | esconde o método quando o destino é o país de onde o pacote sai |
+| Dias até o despacho | a data planejada que a DHL cota (dias úteis, até 9) |
+| Código HS padrão | para produto sem `hs_code` (ex.: `490199`, livro impresso) |
+| Caixas disponíveis / Embalagem padrão | como na Loggi: entra a menor caixa que comporta o pedido |
+| Formato da etiqueta | 8 × 4 pol (térmica), A6 ou A4 |
+| Fatura comercial pela DHL | pede o PDF da commercial invoice junto com a etiqueta |
+| Pedir coleta | agenda a coleta ao criar o envio (horário limite e local) |
+
+---
+
+## Incoterm e o checkout: leia isto
 
 O padrão é **DAP** — o destinatário paga imposto de importação e desembaraço na entrega.
 
-Quando a cotação é internacional e o incoterm é DAP, o módulo devolve um `warning_message`
-dizendo isso. **Mostre esse aviso no checkout.** Sem ele o comprador descobre a cobrança só na
-porta de casa, recusa o pacote, e a devolução sai por conta do remetente — frete pago duas
-vezes e venda perdida.
+A cotação devolve um `warning_message` dizendo isso, mas **o checkout do Odoo 18 não mostra o
+aviso da cotação**: só a *Descrição* do método no site (`website_description`), embaixo do nome.
+Ponha o aviso ali. Sem ele o comprador descobre a cobrança na porta de casa, recusa o pacote, e
+a devolução sai por conta do remetente — frete pago duas vezes e venda perdida.
 
 Para a União Europeia isso pesa mais desde 1º de julho de 2026, quando acabou a isenção de
 direitos aduaneiros para remessas de até €150, substituída por uma taxa fixa de €3 por remessa,
@@ -63,55 +89,81 @@ Com **DDP** o remetente assume os impostos e o aviso não aparece.
 
 ## Como funciona
 
-**Cotação** monta `customerDetails`, `packages` e `monetaryAmount` e chama `POST /rates`. Os
-volumes vêm do empacotamento do próprio Odoo (`_get_packages_from_order`).
+Toda chamada leva Basic Auth e o header **`x-version: 3.3.2`**, obrigatório na especificação.
 
-`isCustomsDeclarable` acompanha o destino: verdadeiro só quando o país do remetente difere do
-país de destino.
+**Cotação** (`POST /rates`) manda remetente e destinatário (país, cidade, CEP, estado), os volumes,
+a conta e o valor declarado. Os volumes vêm do empacotamento do próprio Odoo, com as medidas
+da embalagem convertidas da unidade do Odoo (mm) para cm. `isCustomsDeclarable` é verdadeiro
+quando o país de destino difere do de origem.
 
-A DHL devolve o preço em mais de uma moeda; o módulo usa a **faturada** (`currencyType: BILLC`),
-que é a que aparece na sua conta.
+A data planejada vai na **hora local do remetente com o fuso explícito**
+(`2026-10-05T10:00:00GMT-03:00`), pulando fim de semana: a DHL recusa data passada ou mais de
+10 dias à frente.
 
-Sem código de produto configurado, cota a opção mais barata. Com um código fixado e ele
-indisponível para o destino, cota a que houver em vez de falhar.
+A DHL devolve o preço em até três moedas; o módulo usa a **faturada** (`currencyType: BILLC`) e
+converte para a moeda da empresa se forem diferentes. Sem código de produto configurado, cota a
+opção mais barata; com um código fixado e indisponível para o destino, cota a que houver.
 
 **Falha na cotação não estoura.** Devolve `success: False` com a mensagem, e o checkout segue
-com os outros métodos.
+com os outros métodos (timeout de 15 s).
 
-**Envio** usa `POST /shipments`, grava o número de rastreio no picking e anexa a etiqueta em PDF
-que a DHL devolve em base64. Em envio internacional monta a declaração aduaneira a partir das
-linhas do picking, usando o `hs_code` do produto quando existe — livro impresso é NCM/HS 4901,
-que é o padrão quando o produto não tem código próprio.
+**Envio** (`POST /shipments`) na validação da entrega. Antes, cota de novo os volumes da
+entrega: dá o produto (obrigatório no envio) e o custo real. O payload leva:
 
-**Cancelamento não existe na API.** A MyDHL API não cancela envio já criado; o módulo diz isso
-explicitamente em vez de falhar em silêncio. O cancelamento é feito no painel do MyDHL.
+* remetente com **CNPJ** (`registrationNumbers`, código `CNP` da DHL para CNPJ/CPF brasileiro),
+  destinatário com nome, telefone (obrigatório) e e-mail, tipo `business` ou `private`;
+* `declaredValue` e `declaredValueCurrency` (exigidos pela DHL em envio declarável);
+* declaração aduaneira: uma linha por produto com código HS (do produto, ou o padrão do método),
+  preço **unitário**, quantidade em `PCS`, país de fabricação e peso **total da linha** (a DHL
+  não multiplica); motivo `sale`/`permanent`; `placeOfIncoterm` é a cidade de destino;
+* com NF-e autorizada na venda (localização fiscal OCA), o número dela vira o número da fatura e
+  a chave vai nas observações (`remarks`). **A API não tem campo próprio para NF-e: confirme com
+  a DHL Brasil** como ela quer receber.
 
-### Detalhes que a documentação não enfatiza
+A etiqueta (e a fatura comercial, se pedida) volta em PDF base64 e é anexada à entrega. Não há
+reimpressão de etiqueta pela API.
 
-`plannedShippingDateAndTime` é recusado sem fuso horário explícito. O módulo sempre envia o
-offset.
+**Rastreio**: link `https://www.dhl.com/br-pt/home/rastreamento.html?tracking-id=<AWB>&submit=1`
+no portal; botão *Atualizar rastreio* registra o último evento na entrega.
 
-Peso ou dimensão zerada é recusada. O módulo garante um mínimo, para não gastar a chamada.
+**Cancelamento**: a MyDHL API **não cancela conhecimento**, só coleta
+(`DELETE /pickups/{número}`). O módulo cancela a coleta agendada, se houver, e registra na
+entrega que o pacote não deve ser entregue à DHL — confira no MyDHL.
+
+### Exportação a partir do Brasil
+
+Pelas regras da DHL Brasil, até **USD 1.000** o despacho é simplificado (courier): CNPJ do
+exportador, fatura comercial com o frete e a NF-e de exportação. Acima disso, ou volume acima de
+120 × 80 × 80 cm, o despacho é formal, com DU-E e despachante — fora do que este módulo faz.
+
+### Erros
+
+A DHL responde no formato da RFC 7807 e detalha o campo recusado em `additionalDetails`; a
+mensagem mostrada junta as duas coisas.
 
 ---
 
 ## Testes
 
 ```bash
-docker run --rm --network <rede> -v "$PWD":/mnt/extra-addons:ro \
-  -e HOST=<db> -e USER=odoo -e PASSWORD=odoo odoo:17.0 \
-  odoo -d dhl_test --addons-path=/mnt/extra-addons,/usr/lib/python3/dist-packages/odoo/addons \
-  -i delivery_dhl_express --test-enable --test-tags /delivery_dhl_express \
-  --stop-after-init --without-demo=all
+docker run --rm --network <rede> \
+  -v "$PWD/delivery_dhl_express":/opt/odoo/custom/src/private/delivery_dhl_express:ro \
+  -e PGHOST=<db> -e PGUSER=odoo -e PGPASSWORD=odoo -e WAIT_DB=true \
+  ghcr.io/evolars/odoo-template:18.0 \
+  odoo -d dhl_test -i delivery_dhl_express --test-enable --test-tags /delivery_dhl_express \
+  --stop-after-init --without-demo=all --http-port 8099
 ```
 
-25 testes, nenhum tocando a rede.
+31 testes, nenhum tocando a rede: Basic Auth e `x-version`, formato de erro, cotação (payload,
+fuso da data, moeda faturada e conversão, produto fixo e fallback, aviso DAP, só internacional,
+falhas sem exceção, simulação), teste de conexão, envio (payload completo, CNPJ, declaração,
+documentos anexados, telefone e HS obrigatórios, coleta), cancelamento da coleta e rastreio.
 
 ---
 
 ## Estado
 
-Escrito contra a [documentação oficial](https://developer.dhl.com/api-reference/dhl-express-mydhl-api)
-e testado com as chamadas interceptadas. **Ainda não validado contra a API real** — falta a
-conta. Conte com um ajuste fino quando as credenciais chegarem: códigos de produto variam por
-conta e por rota, e a validação de endereço da DHL é mais rígida do que a documentação sugere.
+Escrito contra a especificação OpenAPI oficial da MyDHL API **3.3.2** (06/09/2026), conferida
+em 02/10/2026. **Ainda não validado contra a API real** — falta a conta. Pontos a confirmar na
+primeira chamada: códigos de produto da conta e da rota, onde a DHL Brasil quer a NF-e, e se a
+validação de endereço aceita o formato de rua brasileiro.

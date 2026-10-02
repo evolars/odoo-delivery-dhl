@@ -1,18 +1,18 @@
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-from odoo import _, fields, models
+import pytz
+
+from odoo import fields, models
 from odoo.exceptions import UserError
 
 from .dhl_client import (
-    DEFAULT_HS_CODE,
     INCOTERM_DAP,
     INCOTERM_DDP,
     DhlClient,
-    address_payload,
+    DhlError,
     extract_products,
-    package_payload,
-    rate_payload,
+    tax_id,
 )
 
 _logger = logging.getLogger(__name__)
@@ -21,6 +21,21 @@ INCOTERM_CHOICE = [
     (INCOTERM_DAP, "DAP — destinatário paga impostos na entrega"),
     (INCOTERM_DDP, "DDP — remetente paga impostos"),
 ]
+
+LABEL_TEMPLATES = [
+    ("ECOM26_84_001", "8 × 4 pol (impressora térmica)"),
+    ("ECOM26_A6_002", "A6"),
+    ("ECOM26_84_A4_001", "A4"),
+]
+
+# Limites de tamanho dos campos de texto da API.
+MAX_ADDRESS_LINE = 45
+MAX_CITY = 45
+MAX_CONTENT_DESCRIPTION = 70
+MAX_REFERENCE = 35
+
+# A DHL só aceita data planejada até 10 dias à frente.
+MAX_LEAD_DAYS = 9
 
 
 class DeliveryCarrier(models.Model):
@@ -32,25 +47,63 @@ class DeliveryCarrier(models.Model):
     )
     dhl_api_key = fields.Char(string="Chave da API", groups="base.group_system")
     dhl_api_secret = fields.Char(string="Segredo da API", groups="base.group_system")
-    dhl_account_number = fields.Char(string="Número da Conta DHL")
+    dhl_account_number = fields.Char(
+        string="Número da Conta DHL",
+        help="A conta de exportação (shipper) que paga o frete.",
+    )
     dhl_product_code = fields.Char(
         string="Código do Produto",
-        help="Deixe vazio para a DHL escolher a opção mais barata entre as "
-             "disponíveis. Preencha para fixar um serviço (ex.: P de Express Worldwide).",
+        help="Deixe vazio para cotar a opção mais barata entre as disponíveis. "
+             "Preencha para fixar um serviço (ex.: P de Express Worldwide).",
     )
     dhl_incoterm = fields.Selection(
-        INCOTERM_CHOICE, string="Incoterm", default=INCOTERM_DAP, required=False,
+        INCOTERM_CHOICE, string="Incoterm", default=INCOTERM_DAP,
         help="DAP é o padrão: o destinatário paga imposto de importação e "
              "desembaraço na entrega. Avise isso no checkout, ou o pacote é recusado.",
     )
+    dhl_international_only = fields.Boolean(
+        string="Só internacional", default=True,
+        help="Esconde o método quando o destino é o mesmo país de onde o pacote sai.",
+    )
     dhl_default_package_type_id = fields.Many2one(
         "stock.package.type", string="Embalagem padrão",
-        help="Caixa usada para dividir o pedido em volumes.",
+        help="Caixa usada quando nenhuma das caixas disponíveis comporta o pedido: "
+             "o pedido é dividido em volumes dela, pelo peso máximo.",
+    )
+    dhl_package_type_ids = fields.Many2many(
+        "stock.package.type", "delivery_carrier_dhl_package_type_rel",
+        string="Caixas disponíveis",
+        help="Na cotação, entra a menor caixa cujo peso máximo comporta o pedido.",
+    )
+    dhl_default_hs_code = fields.Char(
+        string="Código HS padrão",
+        help="Usado na declaração aduaneira quando o produto não tem código HS "
+             "próprio (ex.: 490199 para livro impresso).",
     )
     dhl_lead_days = fields.Integer(
         string="Dias até o despacho", default=1,
         help="Quantos dias úteis o pedido leva para sair daqui. A DHL cota a "
-             "partir dessa data, não da data do pedido.",
+             "partir dessa data (no máximo 9 dias).",
+    )
+    dhl_label_template = fields.Selection(
+        LABEL_TEMPLATES, string="Formato da etiqueta", default="ECOM26_84_001",
+    )
+    dhl_commercial_invoice = fields.Boolean(
+        string="Fatura comercial pela DHL", default=True,
+        help="Pede à DHL a fatura comercial (commercial invoice) em PDF junto com a "
+             "etiqueta, montada a partir da declaração aduaneira.",
+    )
+    dhl_request_pickup = fields.Boolean(
+        string="Pedir coleta",
+        help="Agenda a coleta da DHL ao criar o envio. Sem isso, o pacote é levado a "
+             "um ponto da DHL ou entra na coleta já contratada.",
+    )
+    dhl_pickup_close_time = fields.Char(
+        string="Horário limite da coleta", default="18:00",
+        help="Até que horas o local recebe o motorista (HH:MM).",
+    )
+    dhl_pickup_location = fields.Char(
+        string="Local da coleta", help="Ex.: Recepção, Expedição.",
     )
     dhl_simulation = fields.Boolean(
         string="Modo simulação",
@@ -67,27 +120,39 @@ class DeliveryCarrier(models.Model):
         """Cliente com as credenciais deste método.
 
         O ambiente segue o campo `prod_environment` do método: fora de
-        produção as chamadas vão para o sandbox, que tem 500 chamadas por dia.
+        produção as chamadas vão para o ambiente de teste, que tem 500
+        chamadas por dia.
         """
         self.ensure_one()
+        carrier = self.sudo()
         return DhlClient(
-            api_key=self.dhl_api_key,
-            api_secret=self.dhl_api_secret,
-            account_number=self.dhl_account_number,
+            api_key=carrier.dhl_api_key,
+            api_secret=carrier.dhl_api_secret,
+            account_number=carrier.dhl_account_number,
             test_mode=self.prod_environment is not True,
+            env=self.env,
         )
 
     def action_dhl_test_connection(self):
+        """Valida a credencial e, de quebra, se a DHL coleta no endereço de saída."""
         self.ensure_one()
         client = self._dhl_get_client()
-        client.ping()
+        remetente = self._dhl_shipper_partner()
+        endereco = self._dhl_address(remetente)
+        client.validate_address(
+            "pickup", endereco["countryCode"],
+            postal_code=endereco.get("postalCode"), city_name=endereco["cityName"],
+        )
+        ambiente = self.env._("teste") if client.test_mode else self.env._("produção")
         return {
             "type": "ir.actions.client",
             "tag": "display_notification",
             "params": {
                 "type": "success",
-                "message": _("Conexão com a DHL Express (%s) confirmada.") % (
-                    "sandbox" if client.test_mode else "produção"
+                "message": self.env._(
+                    "Conexão com a DHL Express (%(ambiente)s) confirmada, e a DHL "
+                    "atende a coleta em %(cidade)s.",
+                    ambiente=ambiente, cidade=endereco["cityName"],
                 ),
                 "sticky": False,
             },
@@ -101,22 +166,188 @@ class DeliveryCarrier(models.Model):
         company = (order or picking or self).company_id or self.env.company
         return company.partner_id
 
-    def _dhl_planned_date(self):
-        """Data do despacho com fuso explícito — a DHL recusa sem offset."""
-        self.ensure_one()
-        quando = fields.Datetime.now() + timedelta(days=max(self.dhl_lead_days, 0))
-        return quando.strftime("%Y-%m-%dT%H:%M:%S GMT+00:00").replace(" ", "")
+    def _match(self, partner, order):
+        """Método só internacional some do checkout para destino nacional."""
+        if self.delivery_type == "dhl_express" and self.dhl_international_only:
+            origem = self._dhl_shipper_partner(order=order).country_id
+            if origem and partner.country_id == origem:
+                return False
+        return super()._match(partner, order)
 
-    def _dhl_packages(self, packages):
-        return [
-            package_payload(
-                weight_kg=p.weight,
-                length_cm=(p.dimension or {}).get("length") or 0,
-                width_cm=(p.dimension or {}).get("width") or 0,
-                height_cm=(p.dimension or {}).get("height") or 0,
-            )
-            for p in packages
-        ]
+    def _dhl_planned_date(self, shipper=None):
+        """Data do despacho na hora local do remetente, com o fuso explícito
+        ("2026-10-05T10:00:00GMT-03:00"): é o formato da especificação, e a
+        DHL recusa data passada ou mais de 10 dias à frente."""
+        self.ensure_one()
+        nome_fuso = (shipper and shipper.tz) or self.env.user.tz or "UTC"
+        try:
+            fuso = pytz.timezone(nome_fuso)
+        except pytz.UnknownTimeZoneError:
+            fuso = pytz.utc
+        agora = datetime.now(fuso)
+        dias = min(max(self.dhl_lead_days or 0, 0), MAX_LEAD_DAYS)
+        if dias:
+            quando = (agora + timedelta(days=dias)).replace(
+                hour=10, minute=0, second=0, microsecond=0)
+            while quando.weekday() >= 5:
+                quando += timedelta(days=1)
+            quando = fuso.normalize(quando)
+        else:
+            quando = (agora + timedelta(minutes=30)).replace(microsecond=0)
+        offset = quando.utcoffset() or timedelta(0)
+        minutos = int(offset.total_seconds() // 60)
+        sinal = "+" if minutos >= 0 else "-"
+        minutos = abs(minutos)
+        return "%sGMT%s%02d:%02d" % (
+            quando.strftime("%Y-%m-%dT%H:%M:%S"), sinal, minutos // 60, minutos % 60,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Unidades                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _dhl_length_cm(self, value):
+        """Medida da embalagem, na unidade do Odoo (mm por padrão), em cm."""
+        uom = self.env["product.template"]._get_length_uom_id_from_ir_config_parameter()
+        return uom._compute_quantity(value or 0.0, self.env.ref("uom.product_uom_cm"),
+                                     round=False)
+
+    def _dhl_weight_kg(self, value):
+        uom = self.env["product.template"]._get_weight_uom_id_from_ir_config_parameter()
+        return uom._compute_quantity(value or 0.0, self.env.ref("uom.product_uom_kgm"),
+                                     round=False)
+
+    def _dhl_package_payload(self, package):
+        """Um volume. A DHL aceita decimal, mas recusa zero."""
+        dimensao = package.dimension or {}
+        medidas = {
+            lado: max(round(self._dhl_length_cm(dimensao.get(chave)), 1), 1.0)
+            for lado, chave in (("length", "length"), ("width", "width"),
+                                ("height", "height"))
+        }
+        return {
+            "weight": max(round(self._dhl_weight_kg(package.weight), 3), 0.001),
+            "dimensions": medidas,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Endereço e partes                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _dhl_address(self, partner, full=False):
+        """Endereço da DHL. Cidade, país e CEP bastam para cotar; o endereço
+        completo só é exigido na criação do envio."""
+        _ = self.env._
+        if not partner.country_id:
+            raise DhlError(_(
+                "Informe o país de %s: a DHL cota por país de destino.",
+                partner.display_name,
+            ))
+        cidade = partner.city
+        if "city_id" in partner._fields and partner.city_id:
+            cidade = partner.city_id.name
+        if not cidade:
+            raise DhlError(_("Informe a cidade de %s.", partner.display_name))
+        endereco = {
+            "postalCode": tax_id(partner.zip)[:12],
+            "cityName": cidade[:MAX_CITY],
+            "countryCode": partner.country_id.code,
+        }
+        if partner.state_id.code and len(partner.state_id.code) >= 2:
+            endereco["provinceCode"] = partner.state_id.code[:35]
+        if full:
+            bairro = partner.district if "district" in partner._fields else False
+            linhas = [linha.strip()[:MAX_ADDRESS_LINE]
+                      for linha in (partner.street, partner.street2, bairro) if linha]
+            if not linhas:
+                raise DhlError(_("Informe o endereço (rua) de %s.", partner.display_name))
+            for numero, linha in enumerate(linhas[:3], start=1):
+                endereco["addressLine%d" % numero] = linha
+        return endereco
+
+    def _dhl_registration_numbers(self, partner):
+        """CNPJ/CPF de parte brasileira (código CNP da DHL); VAT de empresa
+        estrangeira. A IE fica de fora: a especificação a chama de IE e o guia de
+        referência da própria DHL, de STA."""
+        comercial = partner.commercial_partner_id
+        documento = tax_id(partner.vat) or tax_id(comercial.vat)
+        pais = (partner.country_id or comercial.country_id).code
+        registros = []
+        if pais == "BR":
+            if len(documento) in (11, 14):
+                registros.append({"typeCode": "CNP", "number": documento,
+                                  "issuerCountryCode": "BR"})
+        elif documento and comercial.is_company:
+            registros.append({"typeCode": "VAT", "number": documento[:35],
+                              "issuerCountryCode": pais})
+        return registros
+
+    def _dhl_party(self, partner):
+        _ = self.env._
+        telefone = partner.phone or getattr(partner, "mobile", False) or (
+            partner.commercial_partner_id.phone)
+        if not telefone:
+            raise DhlError(_(
+                "Informe o telefone de %s: a DHL exige telefone do remetente e do "
+                "destinatário.", partner.display_name,
+            ))
+        comercial = partner.commercial_partner_id
+        empresa = partner.commercial_company_name or comercial.name or partner.name
+        contato = {
+            "fullName": (partner.name or comercial.name)[:255],
+            "companyName": empresa[:100],
+            "phone": telefone[:70],
+        }
+        email = partner.email or comercial.email
+        if email:
+            contato["email"] = email[:70]
+        party = {
+            "postalAddress": self._dhl_address(partner, full=True),
+            "contactInformation": contato,
+            "typeCode": "business" if comercial.is_company else "private",
+        }
+        registros = self._dhl_registration_numbers(partner)
+        if registros:
+            party["registrationNumbers"] = registros
+        return party
+
+    # ------------------------------------------------------------------ #
+    # Cotação                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _dhl_order_package_type(self, order):
+        """A menor caixa que comporta o pedido; sem nenhuma, a embalagem padrão."""
+        peso = order._get_estimated_weight()
+        caixas = self.dhl_package_type_ids.filtered(
+            lambda caixa: caixa.max_weight and caixa.max_weight >= peso + caixa.base_weight
+        )
+        if caixas:
+            return min(caixas, key=lambda caixa: (
+                caixa.packaging_length * caixa.width * caixa.height, caixa.max_weight,
+            ))
+        return self.dhl_default_package_type_id
+
+    def _dhl_rate_payload(self, shipper, receiver, packages, declared_value, currency):
+        internacional = shipper.country_id != receiver.country_id
+        payload = {
+            "customerDetails": {
+                "shipperDetails": self._dhl_address(shipper),
+                "receiverDetails": self._dhl_address(receiver),
+            },
+            "plannedShippingDateAndTime": self._dhl_planned_date(shipper),
+            "unitOfMeasurement": "metric",
+            "isCustomsDeclarable": internacional,
+            "packages": packages,
+        }
+        if self.dhl_account_number:
+            payload["accounts"] = [{"typeCode": "shipper", "number": self.dhl_account_number}]
+        if declared_value:
+            payload["monetaryAmount"] = [{
+                "typeCode": "declaredValue",
+                "value": round(declared_value, 2),
+                "currency": (currency or "BRL").upper(),
+            }]
+        return payload
 
     def _dhl_pick_product(self, produtos):
         """Escolhe o serviço: o fixado, se houver, senão o mais barato."""
@@ -128,18 +359,23 @@ class DeliveryCarrier(models.Model):
                 return fixos[0]
             # serviço fixado indisponível para o destino: cotar o que há é
             # melhor que não cotar
-            _logger.info(
-                "DHL: produto %s indisponível; usando a opção mais barata.",
-                self.dhl_product_code,
-            )
+            _logger.info("DHL: produto %s indisponível; usando a opção mais barata.",
+                         self.dhl_product_code)
         return min(produtos, key=lambda p: p["price"])
 
-    # ------------------------------------------------------------------ #
-    # Contrato do delivery.carrier                                        #
-    # ------------------------------------------------------------------ #
+    def _dhl_price_in_company_currency(self, produto, company):
+        """A DHL cota na moeda da conta (BILLC); o Odoo espera a da empresa."""
+        moeda = self.env["res.currency"].with_context(active_test=False).search(
+            [("name", "=", produto.get("currency") or "")], limit=1
+        )
+        if not moeda or moeda == company.currency_id:
+            return produto["price"]
+        return moeda._convert(produto["price"], company.currency_id, company,
+                              fields.Date.context_today(self))
 
     def dhl_express_rate_shipment(self, order):
         self.ensure_one()
+        _ = self.env._
         if self.dhl_simulation:
             return {
                 "success": True,
@@ -153,20 +389,20 @@ class DeliveryCarrier(models.Model):
 
         remetente = self._dhl_shipper_partner(order=order)
         destinatario = order.partner_shipping_id
-        internacional = remetente.country_id != destinatario.country_id
         try:
-            packages = self._get_packages_from_order(
-                order, self.dhl_default_package_type_id
+            caixa = self._dhl_order_package_type(order)
+            if not caixa:
+                raise DhlError(_("Configure a embalagem padrão do método %s.", self.name))
+            pacotes = self._get_packages_from_order(order, caixa)
+            linhas = order.order_line.filtered(
+                lambda line: not line.is_delivery and not line.display_type
             )
-            response = self._dhl_get_client().rates(rate_payload(
-                shipper=address_payload(remetente),
-                receiver=address_payload(destinatario),
-                packages=self._dhl_packages(packages),
-                planned_date=self._dhl_planned_date(),
-                account_number=self.dhl_account_number,
-                declared_value=order.amount_untaxed,
-                currency=order.currency_id.name or "BRL",
-                customs_declarable=internacional,
+            # valor declarado: o que o cliente paga pelos produtos, não o custo
+            valor = sum(line.price_reduce_taxinc * line.product_uom_qty for line in linhas)
+            response = self._dhl_get_client().rates(self._dhl_rate_payload(
+                remetente, destinatario,
+                [self._dhl_package_payload(pacote) for pacote in pacotes],
+                valor, order.currency_id.name,
             ))
         except UserError as error:
             # Cotação não pode estourar no checkout: o comprador precisa seguir
@@ -183,154 +419,281 @@ class DeliveryCarrier(models.Model):
             }
 
         aviso = False
-        if internacional and self.dhl_incoterm == INCOTERM_DAP:
+        if remetente.country_id != destinatario.country_id and self.dhl_incoterm == INCOTERM_DAP:
             aviso = _(
                 "Imposto de importação e desembaraço são pagos pelo destinatário "
                 "na entrega, e não estão incluídos neste frete."
             )
         return {
             "success": True,
-            "price": produto["price"],
+            "price": self._dhl_price_in_company_currency(produto, order.company_id),
             "error_message": False,
             "warning_message": aviso,
         }
 
+    # ------------------------------------------------------------------ #
+    # Envio                                                               #
+    # ------------------------------------------------------------------ #
+
     def dhl_express_send_shipping(self, pickings):
         self.ensure_one()
+        _ = self.env._
         if self.dhl_simulation:
             raise UserError(_(
                 "O método DHL está em modo simulação: dá para cotar, mas não "
                 "para despachar. Desligue a simulação e informe as credenciais."
             ))
-        resultado = []
         client = self._dhl_get_client()
+        resultado = []
         for picking in pickings:
-            response = client.create_shipment(self._dhl_shipment_payload(picking))
+            pacotes = self._get_packages_from_picking(picking, self.dhl_default_package_type_id)
+            produto = self._dhl_rate_picking(client, picking, pacotes)
+            response = client.create_shipment(
+                self._dhl_shipment_payload(picking, pacotes, produto)
+            )
             tracking = response.get("shipmentTrackingNumber")
             if not tracking:
-                raise UserError(_(
+                raise DhlError(_(
                     "A DHL aceitou o envio mas não devolveu número de rastreio. "
                     "Confira no MyDHL antes de repetir, para não duplicar o pacote."
                 ))
-            picking.carrier_tracking_ref = tracking
-            self._dhl_attach_documents(picking, response)
-            resultado.append({"exact_price": picking.carrier_price or 0.0,
-                              "tracking_number": tracking})
+            picking.dhl_dispatch_confirmation = response.get("dispatchConfirmationNumber")
+            self._dhl_attach_documents(picking, response, tracking)
+            resultado.append({
+                "exact_price": self._dhl_price_in_company_currency(produto, picking.company_id),
+                "tracking_number": tracking,
+            })
         return resultado
 
-    def _dhl_shipment_payload(self, picking):
+    def _dhl_rate_picking(self, client, picking, pacotes):
+        """Cota de novo na hora do envio: dá o produto (obrigatório no envio) e
+        o custo real destes volumes."""
+        remetente = self._dhl_shipper_partner(picking=picking)
+        response = client.rates(self._dhl_rate_payload(
+            remetente, picking.partner_id,
+            [self._dhl_package_payload(pacote) for pacote in pacotes],
+            self._dhl_commodities_value(pacotes),
+            picking.company_id.currency_id.name,
+        ))
+        produto = self._dhl_pick_product(extract_products(response))
+        if not produto:
+            raise DhlError(self.env._(
+                "A DHL não atende o endereço de %s.", picking.partner_id.display_name
+            ))
+        return produto
+
+    @staticmethod
+    def _dhl_commodities(pacotes):
+        return [commodity for pacote in pacotes for commodity in pacote.commodities]
+
+    def _dhl_commodities_value(self, pacotes):
+        return sum(c.monetary_value * c.qty for c in self._dhl_commodities(pacotes))
+
+    def _dhl_pickup(self):
+        if not self.dhl_request_pickup:
+            return {"isRequested": False}
+        pickup = {"isRequested": True}
+        if self.dhl_pickup_close_time:
+            pickup["closeTime"] = self.dhl_pickup_close_time.strip()[:5]
+        if self.dhl_pickup_location:
+            pickup["location"] = self.dhl_pickup_location[:80]
+        return pickup
+
+    def _dhl_shipment_payload(self, picking, pacotes, produto):
+        _ = self.env._
         remetente = self._dhl_shipper_partner(picking=picking)
         destinatario = picking.partner_id
         internacional = remetente.country_id != destinatario.country_id
-        packages = self._get_packages_from_picking(
-            picking, self.dhl_default_package_type_id
-        )
         moeda = picking.company_id.currency_id.name or "BRL"
-        payload = {
-            "plannedShippingDateAndTime": self._dhl_planned_date(),
-            "pickup": {"isRequested": False},
-            "productCode": self.dhl_product_code or "P",
-            "accounts": [{"typeCode": "shipper", "number": self.dhl_account_number}],
-            "customerDetails": {
-                "shipperDetails": self._dhl_full_address(remetente),
-                "receiverDetails": self._dhl_full_address(destinatario),
-            },
-            "content": {
-                "packages": self._dhl_packages(packages),
-                "isCustomsDeclarable": internacional,
-                "description": picking.name,
-                "incoterm": self.dhl_incoterm or INCOTERM_DAP,
-                "unitOfMeasurement": "metric",
-            },
-            "outputImageProperties": {
-                "imageOptions": [{"typeCode": "label", "templateName": "ECOM26_84_001"}],
-            },
-            "customerReferences": [{"value": picking.name, "typeCode": "CU"}],
+        referencia = (picking.sale_id.name or picking.name)[:MAX_REFERENCE]
+
+        shipper = self._dhl_party(remetente)
+        if remetente.country_id.code == "BR" and not shipper.get("registrationNumbers"):
+            # a empresa costuma estar no parceiro da empresa, não no do depósito
+            shipper["registrationNumbers"] = self._dhl_registration_numbers(
+                picking.company_id.partner_id)
+        if remetente.country_id.code == "BR" and not shipper.get("registrationNumbers"):
+            raise DhlError(_("Preencha o CNPJ da empresa: a DHL exige o do exportador."))
+
+        volumes = []
+        for pacote in pacotes:
+            volume = self._dhl_package_payload(pacote)
+            volume["customerReferences"] = [{"value": referencia, "typeCode": "CU"}]
+            volumes.append(volume)
+
+        imagens = [{"typeCode": "label",
+                    "templateName": self.dhl_label_template or "ECOM26_84_001"}]
+        if internacional and self.dhl_commercial_invoice:
+            imagens.append({"typeCode": "invoice", "isRequested": True,
+                            "invoiceType": "commercial"})
+
+        content = {
+            "packages": volumes,
+            "isCustomsDeclarable": internacional,
+            "description": self._dhl_content_description(pacotes),
+            "incoterm": self.dhl_incoterm or INCOTERM_DAP,
+            "unitOfMeasurement": "metric",
         }
         if internacional:
-            payload["content"]["exportDeclaration"] = self._dhl_export_declaration(
-                picking, moeda
-            )
+            content["declaredValue"] = round(self._dhl_commodities_value(pacotes), 2)
+            content["declaredValueCurrency"] = moeda
+            content["exportDeclaration"] = self._dhl_export_declaration(
+                picking, pacotes, destinatario, referencia)
+
+        payload = {
+            "plannedShippingDateAndTime": self._dhl_planned_date(remetente),
+            "pickup": self._dhl_pickup(),
+            "productCode": produto["code"],
+            "accounts": [{"typeCode": "shipper", "number": self.dhl_account_number}],
+            "customerDetails": {
+                "shipperDetails": shipper,
+                "receiverDetails": self._dhl_party(destinatario),
+            },
+            "content": content,
+            "outputImageProperties": {"encodingFormat": "pdf", "imageOptions": imagens},
+            "customerReferences": [{"value": referencia, "typeCode": "CU"}],
+        }
+        if produto.get("local_code"):
+            payload["localProductCode"] = produto["local_code"]
         return payload
 
-    def _dhl_full_address(self, partner):
-        """Endereço completo, exigido na criação do envio (não na cotação)."""
-        endereco = address_payload(partner)
-        endereco["addressLine1"] = (partner.street or "")[:45] or "-"
-        if partner.street2:
-            endereco["addressLine2"] = partner.street2[:45]
-        return {
-            "postalAddress": endereco,
-            "contactInformation": {
-                "fullName": partner.name or "-",
-                "companyName": (partner.commercial_company_name or partner.name or "-")[:60],
-                "phone": (partner.mobile or partner.phone or "")[:25],
-                "email": partner.email or "",
-            },
-        }
+    def _dhl_content_description(self, pacotes):
+        nomes = []
+        for commodity in self._dhl_commodities(pacotes):
+            nome = commodity.product_id.name
+            if nome and nome not in nomes:
+                nomes.append(nome)
+        descricao = ", ".join(nomes).strip() or self.env._("Mercadorias")
+        return descricao[:MAX_CONTENT_DESCRIPTION]
 
-    def _dhl_export_declaration(self, picking, moeda):
-        """Declaração aduaneira. Cada item precisa de NCM/HS e valor."""
+    def _dhl_export_declaration(self, picking, pacotes, destinatario, referencia):
+        """Declaração aduaneira. Cada item precisa de código HS, valor unitário e
+        o peso total da linha (a DHL não multiplica pela quantidade)."""
+        _ = self.env._
+        pais_empresa = picking.company_id.country_id.code or "BR"
         linhas = []
-        for indice, move in enumerate(picking.move_ids, start=1):
-            produto = move.product_id
-            hs_code = getattr(produto, "hs_code", False) or DEFAULT_HS_CODE
+        for numero, commodity in enumerate(self._dhl_commodities(pacotes), start=1):
+            produto = commodity.product_id
+            codigo_hs = tax_id(produto.hs_code or self.dhl_default_hs_code)
+            if not codigo_hs:
+                raise DhlError(_(
+                    "Informe o código HS de %s (ou o código padrão no método de "
+                    "entrega): a declaração aduaneira exige.", produto.display_name,
+                ))
+            quantidade = int(commodity.qty) or 1
+            peso = round(self._dhl_weight_kg(produto.weight) * quantidade, 3)
+            descricao = produto.display_name or ""
+            if len(descricao) < 3:
+                # a DHL recusa descrição com menos de 3 caracteres
+                descricao = "%s %s" % (_("Item"), descricao)
             linhas.append({
-                "number": indice,
-                "description": (produto.name or "")[:75],
-                "price": round(produto.list_price or 0.0, 2),
-                "quantity": {
-                    "value": int(move.product_uom_qty) or 1,
-                    "unitOfMeasurement": "PCS",
-                },
-                "commodityCodes": [{"typeCode": "outbound", "value": hs_code}],
-                "manufacturerCountry": (
-                    picking.company_id.country_id.code or "BR"
-                ),
-                "weight": {
-                    "netValue": round(produto.weight or 0.01, 3),
-                    "grossValue": round(produto.weight or 0.01, 3),
-                },
+                "number": numero,
+                "description": descricao[:512],
+                "price": round(commodity.monetary_value, 2),
+                "quantity": {"value": quantidade, "unitOfMeasurement": "PCS"},
+                "commodityCodes": [{"typeCode": "outbound", "value": codigo_hs[:18]}],
+                "exportReasonType": "permanent",
+                "manufacturerCountry": produto.country_of_origin.code or pais_empresa,
+                "weight": {"netValue": peso, "grossValue": peso},
             })
-        return {
+        if not linhas:
+            raise DhlError(_("A entrega %s não tem produto para declarar.", picking.name))
+        declaracao = {
             "lineItems": linhas,
             "invoice": {
-                "number": picking.name,
+                "number": referencia,
                 "date": fields.Date.context_today(self).isoformat(),
             },
             "exportReason": "sale",
-            "placeOfIncoterm": picking.company_id.city or "",
+            "exportReasonType": "permanent",
+            "shipmentType": "commercial",
         }
+        nfe = self._dhl_nfe(picking)
+        if nfe:
+            # A DHL Brasil exige a NF-e de exportação no despacho simplificado,
+            # mas a API não tem campo para ela: a chave vai nas observações e o
+            # número, como número da fatura.
+            declaracao["invoice"]["number"] = nfe["number"]
+            declaracao["remarks"] = [{"value": "NF-e %s" % nfe["key"]}]
+        # DAP/DDP: o lugar do incoterm é o destino
+        if destinatario.city:
+            declaracao["placeOfIncoterm"] = destinatario.city[:256]
+        return declaracao
 
-    def _dhl_attach_documents(self, picking, response):
-        """Guarda a etiqueta que veio em base64 junto ao picking."""
+    def _dhl_nfe(self, picking):
+        """A NF-e autorizada da venda, se a localização fiscal (OCA) estiver
+        instalada. Sem ela, os campos não existem."""
+        faturas = picking.sale_id.invoice_ids.filtered(lambda move: move.state == "posted")
+        if not faturas or "document_key" not in faturas._fields:
+            return False
+        for fatura in faturas.sorted("id", reverse=True):
+            chave = "".join(c for c in (fatura.document_key or "") if c.isdigit())
+            if len(chave) != 44:
+                continue
+            if "state_edoc" in fatura._fields and fatura.state_edoc != "autorizada":
+                continue
+            numero = "".join(c for c in (fatura.document_number or "") if c.isdigit())
+            return {"key": chave, "number": (numero or chave[25:34])[:MAX_REFERENCE]}
+        return False
+
+    def _dhl_attach_documents(self, picking, response, tracking):
+        """Guarda etiqueta e fatura comercial, que vêm em base64, junto à entrega."""
+        anexos = self.env["ir.attachment"]
         for documento in response.get("documents") or []:
             conteudo = documento.get("content")
             if not conteudo:
                 continue
             tipo = documento.get("typeCode") or "label"
-            self.env["ir.attachment"].create({
-                "name": "DHL-%s-%s.pdf" % (tipo, picking.carrier_tracking_ref),
+            prefixo = (self._get_delivery_label_prefix() if tipo == "label"
+                       else self._get_delivery_doc_prefix())
+            formato = (documento.get("imageFormat") or "PDF").lower()
+            anexos |= anexos.create({
+                "name": "%s-%s-%s.%s" % (prefixo, tracking, tipo, formato),
                 "type": "binary",
                 "datas": conteudo,
+                "mimetype": "application/pdf" if formato == "pdf" else False,
                 "res_model": "stock.picking",
                 "res_id": picking.id,
             })
+        if anexos:
+            picking.message_post(
+                body=self.env._("Documentos da DHL para o envio %s.", tracking),
+                attachment_ids=anexos.ids,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Rastreio e cancelamento                                             #
+    # ------------------------------------------------------------------ #
 
     def dhl_express_get_tracking_link(self, picking):
         if not picking.carrier_tracking_ref:
             return False
         return (
             "https://www.dhl.com/br-pt/home/rastreamento.html"
-            "?tracking-id=%s" % picking.carrier_tracking_ref
+            "?tracking-id=%s&submit=1" % picking.carrier_tracking_ref
         )
 
-    def dhl_express_cancel_shipment(self, picking):
-        """A MyDHL API não cancela envio criado; o cancelamento é no painel."""
-        raise UserError(_(
-            "A DHL não permite cancelar um envio pela API. Cancele pelo MyDHL e "
-            "depois limpe o código de rastreio nesta entrega."
-        ))
+    def dhl_express_cancel_shipment(self, pickings):
+        """A MyDHL API não cancela o conhecimento, só a coleta agendada.
+
+        Cancela a coleta, se houver, e deixa registrado o que falta fazer: o
+        conhecimento deixa de valer se o pacote não for entregue à DHL.
+        """
+        self.ensure_one()
+        for picking in pickings:
+            if picking.dhl_dispatch_confirmation:
+                self._dhl_get_client().cancel_pickup(
+                    picking.dhl_dispatch_confirmation,
+                    requestor=self.env.user.name or "Odoo",
+                    reason="Envio cancelado",
+                )
+                picking.dhl_dispatch_confirmation = False
+            picking.message_post(body=self.env._(
+                "A API da DHL não cancela o conhecimento %s: não entregue este pacote "
+                "à DHL e confira no MyDHL. A coleta agendada, se havia, foi cancelada.",
+                picking.carrier_tracking_ref,
+            ))
+        return True
 
     def _dhl_express_get_default_custom_package_code(self):
-        return "YP"
+        return False

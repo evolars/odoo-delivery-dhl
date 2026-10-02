@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 from unittest.mock import patch
 
 import requests
@@ -8,14 +9,12 @@ from odoo.exceptions import UserError
 from odoo.tests import TransactionCase, tagged
 
 from odoo.addons.delivery_dhl_express.models.dhl_client import (
+    API_VERSION,
     PRODUCTION_URL,
     TEST_URL,
     DhlClient,
     DhlError,
-    address_payload,
     extract_products,
-    package_payload,
-    rate_payload,
 )
 
 
@@ -34,16 +33,28 @@ class FakeResponse:
         return self._payload
 
 
-def product(code, price, name=None, days=None):
+def product(code, price, name=None, days=None, currency="BRL"):
     return {
         "productCode": code,
         "productName": name or code,
         "totalPrice": [
-            {"currencyType": "BILLC", "priceCurrency": "BRL", "price": price},
+            {"currencyType": "BILLC", "priceCurrency": currency, "price": price},
             {"currencyType": "PULCL", "priceCurrency": "USD", "price": price / 5},
         ],
         "deliveryCapabilities": {"totalTransitDays": days},
     }
+
+
+SHIPMENT = {
+    "shipmentTrackingNumber": "1234567890",
+    "packages": [{"referenceNumber": 1, "trackingNumber": "JD0001"}],
+    "documents": [
+        {"imageFormat": "PDF", "typeCode": "label",
+         "content": base64.b64encode(b"%PDF etiqueta").decode()},
+        {"imageFormat": "PDF", "typeCode": "invoice",
+         "content": base64.b64encode(b"%PDF fatura").decode()},
+    ],
+}
 
 
 @tagged("post_install", "-at_install", "delivery_dhl_express")
@@ -53,15 +64,15 @@ class TestDhlClient(TransactionCase):
         self.assertEqual(DhlClient("k", "s", "1", test_mode=True).base_url, TEST_URL)
         self.assertEqual(DhlClient("k", "s", "1", test_mode=False).base_url, PRODUCTION_URL)
 
-    def test_basic_auth_header_is_built_from_key_and_secret(self):
-        client = DhlClient("chave", "segredo", "123")
+    def test_every_call_carries_basic_auth_and_the_api_version(self):
         with patch.object(requests, "request", return_value=FakeResponse(payload={})) as call:
-            client.rates({})
-        cabecalho = call.call_args[1]["headers"]["Authorization"]
-        self.assertTrue(cabecalho.startswith("Basic "))
+            DhlClient("chave", "segredo", "123").rates({})
+        cabecalhos = call.call_args[1]["headers"]
         self.assertEqual(
-            base64.b64decode(cabecalho.split(" ", 1)[1]).decode(), "chave:segredo"
+            base64.b64decode(cabecalhos["Authorization"].split()[1]).decode(), "chave:segredo"
         )
+        self.assertEqual(cabecalhos["x-version"], API_VERSION, "header obrigatório")
+        self.assertLessEqual(len(cabecalhos["Message-Reference"]), 36)
 
     def test_missing_credentials_fails_before_the_network(self):
         with patch.object(requests, "request") as call:
@@ -70,192 +81,187 @@ class TestDhlClient(TransactionCase):
         call.assert_not_called()
 
     def test_error_uses_additional_details_when_present(self):
-        """additionalDetails é o que diz qual campo a DHL recusou."""
-        payload = {
-            "detail": "Invalid request",
-            "additionalDetails": ["plannedShippingDateAndTime deve ter fuso horário"],
-        }
+        payload = {"title": "Bad request", "detail": "Validation failed", "status": "400",
+                   "additionalDetails": ["receiverDetails.contactInformation.phone is missing"]}
         with patch.object(requests, "request", return_value=FakeResponse(400, payload)):
             with self.assertRaises(DhlError) as caught:
                 DhlClient("k", "s", "1").rates({})
-        self.assertIn("fuso horário", str(caught.exception))
         self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("phone is missing", str(caught.exception))
+        self.assertIn("Validation failed", str(caught.exception))
 
     def test_connection_failure_becomes_dhl_error(self):
-        with patch.object(requests, "request", side_effect=requests.Timeout("lento")):
+        with patch.object(requests, "request", side_effect=requests.ConnectionError("x")):
             with self.assertRaises(DhlError):
                 DhlClient("k", "s", "1").rates({})
 
-    # --- payload ---------------------------------------------------------- #
+    def test_shipment_without_account_fails_before_the_network(self):
+        with patch.object(requests, "request") as call:
+            with self.assertRaises(DhlError):
+                DhlClient("k", "s", "").create_shipment({})
+        call.assert_not_called()
 
-    def test_package_never_sends_zero(self):
-        """A DHL recusa peso ou dimensão zerada; o mínimo evita erro inútil."""
-        pacote = package_payload(0, 0, 0, 0)
-        self.assertGreater(pacote["weight"], 0)
-        self.assertGreaterEqual(pacote["dimensions"]["length"], 1)
-
-    def test_package_rounds_dimensions_up(self):
-        pacote = package_payload(0.546, 21.0, 14.0, 1.4)
-        self.assertEqual(pacote["dimensions"]["height"], 2)
-        self.assertAlmostEqual(pacote["weight"], 0.546, 3)
-
-    def test_rate_payload_carries_account_and_declared_value(self):
-        corpo = rate_payload(
-            shipper={"countryCode": "BR"}, receiver={"countryCode": "PT"},
-            packages=[package_payload(1, 10, 10, 10)],
-            planned_date="2026-09-22T13:00:00GMT+00:00",
-            account_number="9876", declared_value=178.9, currency="brl",
-        )
-        self.assertEqual(corpo["accounts"][0]["number"], "9876")
-        self.assertEqual(corpo["monetaryAmount"][0]["currency"], "BRL")
-        self.assertEqual(corpo["unitOfMeasurement"], "metric")
-        self.assertTrue(corpo["isCustomsDeclarable"])
-
-    def test_address_requires_a_country(self):
-        partner = self.env["res.partner"].create({"name": "Sem país", "city": "Lisboa"})
-        with self.assertRaises(DhlError):
-            address_payload(partner)
-
-    def test_address_strips_the_zip_mask(self):
-        partner = self.env["res.partner"].create({
-            "name": "Cliente PT", "city": "Lisboa", "zip": "1250-096",
-            "country_id": self.env.ref("base.pt").id,
-        })
-        self.assertEqual(address_payload(partner)["postalCode"], "1250096")
-
-    # --- resposta --------------------------------------------------------- #
+    def test_cancel_pickup_sends_requestor_and_reason(self):
+        with patch.object(requests, "request", return_value=FakeResponse(payload={})) as call:
+            DhlClient("k", "s", "1").cancel_pickup("PRG123", "Fulana", "Envio cancelado")
+        args, kwargs = call.call_args
+        self.assertEqual(args[0], "DELETE")
+        self.assertTrue(args[1].endswith("/pickups/PRG123"))
+        self.assertEqual(kwargs["params"], {"requestorName": "Fulana", "reason": "Envio cancelado"})
 
     def test_products_use_the_billed_currency(self):
-        produtos = extract_products({"products": [product("P", 210.5, "Express Worldwide", 4)]})
-        self.assertEqual(len(produtos), 1)
-        self.assertAlmostEqual(produtos[0]["price"], 210.5, 2)
+        produtos = extract_products({"products": [product("P", 250.0, days=4)]})
+        self.assertEqual(produtos[0]["price"], 250.0)
         self.assertEqual(produtos[0]["currency"], "BRL")
         self.assertEqual(produtos[0]["transit_days"], 4)
 
     def test_product_without_price_is_dropped(self):
-        self.assertEqual(extract_products({"products": [{"productCode": "X"}]}), [])
+        self.assertEqual(extract_products({"products": [{"productCode": "P"}]}), [])
 
 
-@tagged("post_install", "-at_install", "delivery_dhl_express")
-class TestDhlCarrier(TransactionCase):
+class DhlCarrierCase(TransactionCase):
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        br = cls.env.ref("base.br")
         cls.env.company.write({
-            "street": "Rua Teste, 99", "city": "Florianópolis", "zip": "88036-530",
-            "country_id": cls.env.ref("base.br").id,
+            "street": "Rua Idalino Rosso, 478", "city": "Içara", "zip": "88829-124",
+            "state_id": cls.env.ref("base.state_br_sc").id, "country_id": br.id,
+            "vat": "66.903.932/0001-52", "phone": "(48) 9830-5099",
         })
-        cls.package_type = cls.env["stock.package.type"].create({
-            "name": "Caixa", "packaging_length": 24, "width": 17, "height": 5,
-            "max_weight": 10,
+        cls.env.company.partner_id.tz = "America/Sao_Paulo"
+        brl = cls.env.ref("base.BRL")
+        brl.active = True
+        cls.env.company.currency_id = brl
+        cls.box_small = cls.env["stock.package.type"].create({
+            "name": "Caixa P", "packaging_length": 240, "width": 170, "height": 50,
+            "base_weight": 0.08, "max_weight": 1,
         })
-        cls.product = cls.env["product.product"].create({
-            "name": "Livro", "type": "product", "list_price": 50.0, "weight": 0.3,
+        cls.box_large = cls.env["stock.package.type"].create({
+            "name": "Caixa G", "packaging_length": 400, "width": 300, "height": 250,
+            "base_weight": 0.35, "max_weight": 15,
         })
-        cls.abroad = cls.env["res.partner"].create({
-            "name": "Cliente Lisboa", "street": "Rua Augusta, 10", "city": "Lisboa",
+        cls.book = cls.env["product.product"].create({
+            "name": "Livro", "type": "consu", "list_price": 50.0, "weight": 0.3,
+        })
+        cls.buyer = cls.env["res.partner"].create({
+            "name": "Ana Lisboa", "street": "Rua Augusta, 100", "city": "Lisboa",
             "zip": "1100-053", "country_id": cls.env.ref("base.pt").id,
+            "phone": "+351 912 345 678", "email": "ana@example.com",
+        })
+        cls.national_buyer = cls.env["res.partner"].create({
+            "name": "Leitora", "street": "Av. Paulista, 1000", "city": "São Paulo",
+            "zip": "01310-100", "state_id": cls.env.ref("base.state_br_sp").id,
+            "country_id": br.id, "phone": "(11) 98888-7777",
         })
         cls.carrier = cls.env["delivery.carrier"].create({
-            "name": "DHL Express", "delivery_type": "dhl_express",
+            "name": "DHL", "delivery_type": "dhl_express",
             "product_id": cls.env["product.product"].create({
                 "name": "Frete DHL", "type": "service",
             }).id,
-            "dhl_api_key": "k", "dhl_api_secret": "s", "dhl_account_number": "9876",
-            "dhl_default_package_type_id": cls.package_type.id,
+            "dhl_api_key": "k", "dhl_api_secret": "s", "dhl_account_number": "960000000",
+            "dhl_package_type_ids": [(6, 0, [cls.box_small.id, cls.box_large.id])],
+            "dhl_default_package_type_id": cls.box_large.id,
+            "dhl_default_hs_code": "4901.99.00",
         })
 
-    def _order(self, partner=None, qty=2):
+    def _order(self, qty=2, partner=None):
         return self.env["sale.order"].create({
-            "partner_id": (partner or self.abroad).id,
-            "order_line": [(0, 0, {"product_id": self.product.id, "product_uom_qty": qty})],
+            "partner_id": (partner or self.buyer).id,
+            "order_line": [(0, 0, {"product_id": self.book.id, "product_uom_qty": qty,
+                                   "tax_id": [(5, 0, 0)]})],
         })
+
+    def _rate(self, order, *products):
+        resposta = FakeResponse(payload={"products": list(products)})
+        with patch.object(requests, "request", return_value=resposta) as call:
+            return self.carrier.rate_shipment(order), call
+
+
+@tagged("post_install", "-at_install", "delivery_dhl_express")
+class TestDhlRating(DhlCarrierCase):
 
     def test_cheapest_product_wins_by_default(self):
-        order = self._order()
-        with patch.object(requests, "request", return_value=FakeResponse(payload={
-            "products": [product("P", 320.0), product("U", 245.5)],
-        })):
-            result = self.carrier.rate_shipment(order)
+        result, _call = self._rate(self._order(), product("P", 320.0), product("U", 280.0))
         self.assertTrue(result["success"])
-        self.assertAlmostEqual(result["price"], 245.5, 2)
+        self.assertAlmostEqual(result["price"], 280.0, 2)
 
     def test_fixed_product_is_honoured(self):
         self.carrier.dhl_product_code = "P"
-        order = self._order()
-        with patch.object(requests, "request", return_value=FakeResponse(payload={
-            "products": [product("P", 320.0), product("U", 245.5)],
-        })):
-            result = self.carrier.rate_shipment(order)
+        result, _call = self._rate(self._order(), product("P", 320.0), product("U", 280.0))
         self.assertAlmostEqual(result["price"], 320.0, 2)
 
     def test_fixed_product_unavailable_falls_back(self):
-        """Serviço indisponível no destino: cotar o que há é melhor que não cotar."""
-        self.carrier.dhl_product_code = "INEXISTENTE"
-        order = self._order()
-        with patch.object(requests, "request", return_value=FakeResponse(payload={
-            "products": [product("U", 245.5)],
-        })):
-            result = self.carrier.rate_shipment(order)
+        self.carrier.dhl_product_code = "X"
+        result, _call = self._rate(self._order(), product("P", 320.0))
         self.assertTrue(result["success"])
-        self.assertAlmostEqual(result["price"], 245.5, 2)
+        self.assertAlmostEqual(result["price"], 320.0, 2)
+
+    def test_rate_payload_follows_the_api(self):
+        _result, call = self._rate(self._order(qty=2), product("P", 300.0))
+        corpo = call.call_args[1]["json"]
+        remetente = corpo["customerDetails"]["shipperDetails"]
+        self.assertEqual(remetente, {"postalCode": "88829124", "cityName": "Içara",
+                                     "countryCode": "BR", "provinceCode": "SC"})
+        self.assertEqual(corpo["customerDetails"]["receiverDetails"]["countryCode"], "PT")
+        self.assertTrue(corpo["isCustomsDeclarable"])
+        self.assertEqual(corpo["accounts"], [{"typeCode": "shipper", "number": "960000000"}])
+        self.assertEqual(corpo["monetaryAmount"][0]["value"], 100.0)
+        pacote = corpo["packages"][0]
+        # 2 livros de 0,3 kg + caixa P de 0,08 kg; caixa de 240 mm vai como 24 cm
+        self.assertAlmostEqual(pacote["weight"], 0.68, 3)
+        self.assertEqual(pacote["dimensions"], {"length": 24.0, "width": 17.0, "height": 5.0})
+
+    def test_planned_date_is_shipper_local_time_with_offset(self):
+        _result, call = self._rate(self._order(), product("P", 300.0))
+        data = call.call_args[1]["json"]["plannedShippingDateAndTime"]
+        self.assertRegex(data, r"^\d{4}-\d{2}-\d{2}T10:00:00GMT-03:00$")
+        self.assertLessEqual(len(data), 29)
+
+    def test_price_in_another_billing_currency_is_converted(self):
+        usd = self.env.ref("base.USD")
+        usd.active = True
+        self.env["res.currency.rate"].create({
+            "currency_id": usd.id, "rate": 0.2, "company_id": self.env.company.id,
+        })
+        result, _call = self._rate(self._order(), product("P", 50.0, currency="USD"))
+        self.assertAlmostEqual(result["price"], 250.0, 1)
 
     def test_international_dap_warns_about_import_taxes(self):
-        """Sem esse aviso o comprador é surpreendido e recusa o pacote."""
-        order = self._order()
-        with patch.object(requests, "request", return_value=FakeResponse(payload={
-            "products": [product("P", 300.0)],
-        })):
-            result = self.carrier.rate_shipment(order)
+        result, _call = self._rate(self._order(), product("P", 300.0))
         self.assertIn("destinatário", result["warning_message"])
 
     def test_ddp_does_not_warn(self):
         self.carrier.dhl_incoterm = "DDP"
-        order = self._order()
-        with patch.object(requests, "request", return_value=FakeResponse(payload={
-            "products": [product("P", 300.0)],
-        })):
-            result = self.carrier.rate_shipment(order)
+        result, _call = self._rate(self._order(), product("P", 300.0))
         self.assertFalse(result["warning_message"])
 
-    def test_customs_flag_follows_the_destination(self):
-        nacional = self.env["res.partner"].create({
-            "name": "Cliente BR", "city": "São Paulo", "zip": "01310-100",
-            "country_id": self.env.ref("base.br").id,
-        })
-        with patch.object(requests, "request", return_value=FakeResponse(payload={
-            "products": [product("N", 40.0)],
-        })) as call:
-            self.carrier.rate_shipment(self._order(partner=nacional))
-        self.assertFalse(call.call_args[1]["json"]["isCustomsDeclarable"])
+    def test_international_only_hides_the_method_for_brazil(self):
+        self.assertFalse(self.carrier._is_available_for_order(
+            self._order(partner=self.national_buyer)))
+        self.assertTrue(self.carrier._is_available_for_order(self._order()))
+        self.carrier.dhl_international_only = False
+        self.assertTrue(self.carrier._is_available_for_order(
+            self._order(partner=self.national_buyer)))
 
     def test_no_coverage_does_not_raise(self):
-        order = self._order()
-        with patch.object(requests, "request", return_value=FakeResponse(payload={"products": []})):
-            result = self.carrier.rate_shipment(order)
+        result, _call = self._rate(self._order())
         self.assertFalse(result["success"])
         self.assertIn("não atende", result["error_message"])
 
     def test_api_failure_does_not_raise_during_checkout(self):
-        order = self._order()
-        with patch.object(requests, "request", side_effect=requests.ConnectionError("boom")):
-            result = self.carrier.rate_shipment(order)
+        with patch.object(requests, "request", side_effect=requests.ConnectionError("x")):
+            result = self.carrier.rate_shipment(self._order())
         self.assertFalse(result["success"])
-
-    def test_planned_date_carries_a_timezone(self):
-        """A DHL recusa plannedShippingDateAndTime sem offset."""
-        quando = self.carrier._dhl_planned_date()
-        self.assertIn("GMT", quando)
-        self.assertIn("T", quando)
-
-    # --- simulação e despacho --------------------------------------------- #
+        self.assertTrue(result["error_message"])
 
     def test_simulation_quotes_without_touching_the_network(self):
         self.carrier.write({"dhl_simulation": True, "dhl_simulation_price": 199.0})
         with patch.object(requests, "request") as call:
             result = self.carrier.rate_shipment(self._order())
         call.assert_not_called()
+        self.assertTrue(result["success"])
         self.assertAlmostEqual(result["price"], 199.0, 2)
 
     def test_simulation_refuses_to_ship(self):
@@ -263,15 +269,139 @@ class TestDhlCarrier(TransactionCase):
         with self.assertRaises(UserError):
             self.carrier.dhl_express_send_shipping(self.env["stock.picking"])
 
-    def test_cancel_explains_it_must_be_done_in_mydhl(self):
-        """A API não cancela envio criado; melhor dizer isso que falhar em silêncio."""
-        picking = self.env["stock.picking"].new({"carrier_tracking_ref": "1234567890"})
-        with self.assertRaises(UserError) as caught:
-            self.carrier.dhl_express_cancel_shipment(picking)
-        self.assertIn("MyDHL", str(caught.exception))
+    def test_test_connection_validates_the_pickup_address(self):
+        with patch.object(requests, "request", return_value=FakeResponse(payload={
+            "address": [{"countryCode": "BR", "cityName": "ICARA"}],
+        })) as call:
+            action = self.carrier.action_dhl_test_connection()
+        args, kwargs = call.call_args
+        self.assertTrue(args[1].endswith("/address-validate"))
+        self.assertEqual(kwargs["params"]["type"], "pickup")
+        self.assertEqual(kwargs["params"]["postalCode"], "88829124")
+        self.assertEqual(action["params"]["type"], "success")
 
-    def test_tracking_link_needs_a_number(self):
-        picking = self.env["stock.picking"].new({"carrier_tracking_ref": False})
-        self.assertFalse(self.carrier.dhl_express_get_tracking_link(picking))
+
+@tagged("post_install", "-at_install", "delivery_dhl_express")
+class TestDhlShipping(DhlCarrierCase):
+
+    def _picking(self, qty=2, partner=None):
+        order = self._order(qty, partner)
+        order.carrier_id = self.carrier
+        order.action_confirm()
+        picking = order.picking_ids
+        picking.move_ids.quantity = qty
+        return picking
+
+    def _ship(self, picking, shipment=None):
+        respostas = [
+            FakeResponse(payload={"products": [product("P", 320.0), product("U", 280.0)]}),
+            FakeResponse(201, shipment or SHIPMENT),
+        ]
+        with patch.object(requests, "request", side_effect=respostas) as call:
+            result = self.carrier.send_shipping(picking)
+        return result, call
+
+    def test_shipment_payload_follows_the_api(self):
+        picking = self._picking(qty=2)
+        result, call = self._ship(picking)
+
+        self.assertEqual(result, [{"exact_price": 280.0, "tracking_number": "1234567890"}])
+        url, corpo = call.call_args_list[1][0][1], call.call_args_list[1][1]["json"]
+        self.assertTrue(url.endswith("/shipments"))
+        self.assertEqual(corpo["productCode"], "U", "o produto que a nova cotação escolheu")
+        self.assertEqual(corpo["pickup"], {"isRequested": False})
+        self.assertRegex(corpo["plannedShippingDateAndTime"], r"GMT-03:00$")
+
+        remetente = corpo["customerDetails"]["shipperDetails"]
+        self.assertEqual(remetente["registrationNumbers"], [
+            {"typeCode": "CNP", "number": "66903932000152", "issuerCountryCode": "BR"}])
+        self.assertEqual(remetente["postalAddress"]["addressLine1"], "Rua Idalino Rosso, 478")
+        self.assertEqual(remetente["typeCode"], "business")
+        destinatario = corpo["customerDetails"]["receiverDetails"]
+        self.assertEqual(destinatario["typeCode"], "private")
+        self.assertEqual(destinatario["contactInformation"]["companyName"], "Ana Lisboa")
+        self.assertEqual(destinatario["contactInformation"]["phone"], "+351 912 345 678")
+
+        conteudo = corpo["content"]
+        self.assertTrue(conteudo["isCustomsDeclarable"])
+        self.assertEqual(conteudo["incoterm"], "DAP")
+        self.assertEqual(conteudo["declaredValue"], 100.0)
+        self.assertEqual(conteudo["declaredValueCurrency"], "BRL")
+        self.assertEqual(conteudo["description"], "Livro")
+        declaracao = conteudo["exportDeclaration"]
+        linha = declaracao["lineItems"][0]
+        self.assertEqual(linha["commodityCodes"], [{"typeCode": "outbound", "value": "49019900"}])
+        self.assertEqual(linha["quantity"], {"value": 2, "unitOfMeasurement": "PCS"})
+        self.assertEqual(linha["price"], 50.0, "preço unitário")
+        self.assertEqual(linha["weight"]["netValue"], 0.6, "peso total da linha")
+        self.assertEqual(linha["manufacturerCountry"], "BR")
+        self.assertEqual(declaracao["placeOfIncoterm"], "Lisboa")
+        imagens = corpo["outputImageProperties"]
+        self.assertEqual(imagens["encodingFormat"], "pdf")
+        self.assertEqual({i["typeCode"] for i in imagens["imageOptions"]}, {"label", "invoice"})
+
+    def test_label_and_invoice_are_attached(self):
+        picking = self._picking()
+        self._ship(picking)
+        anexos = self.env["ir.attachment"].search(
+            [("res_model", "=", "stock.picking"), ("res_id", "=", picking.id)]
+        )
+        self.assertEqual(len(anexos), 2)
+        self.assertTrue(all(a.mimetype == "application/pdf" for a in anexos))
+        self.assertTrue(any(re.search(r"LabelShipping.*label", a.name) for a in anexos))
+
+    def test_missing_phone_is_refused_with_a_useful_message(self):
+        self.buyer.phone = False
+        picking = self._picking()
+        with self.assertRaises(DhlError) as caught:
+            self._ship(picking)
+        self.assertIn("telefone", str(caught.exception))
+
+    def test_missing_hs_code_is_refused(self):
+        self.carrier.dhl_default_hs_code = False
+        picking = self._picking()
+        with self.assertRaises(DhlError) as caught:
+            self._ship(picking)
+        self.assertIn("HS", str(caught.exception))
+
+    def test_product_hs_code_wins_over_the_default(self):
+        self.book.hs_code = "4901.10"
+        picking = self._picking()
+        _result, call = self._ship(picking)
+        linha = call.call_args_list[1][1]["json"]["content"]["exportDeclaration"]["lineItems"][0]
+        self.assertEqual(linha["commodityCodes"][0]["value"], "490110")
+
+    def test_pickup_can_be_requested(self):
+        self.carrier.write({"dhl_request_pickup": True, "dhl_pickup_close_time": "17:30",
+                            "dhl_pickup_location": "Recepção"})
+        picking = self._picking()
+        envio = dict(SHIPMENT, dispatchConfirmationNumber="PRG261002000001")
+        _result, call = self._ship(picking, envio)
+        self.assertEqual(call.call_args_list[1][1]["json"]["pickup"], {
+            "isRequested": True, "closeTime": "17:30", "location": "Recepção"})
+        self.assertEqual(picking.dhl_dispatch_confirmation, "PRG261002000001")
+
+    def test_cancel_cancels_the_pickup_and_explains_the_waybill(self):
+        self.carrier.dhl_request_pickup = True
+        picking = self._picking()
+        self._ship(picking, dict(SHIPMENT, dispatchConfirmationNumber="PRG1"))
+        with patch.object(requests, "request", return_value=FakeResponse(payload={})) as call:
+            self.carrier.dhl_express_cancel_shipment(picking)
+        self.assertTrue(call.call_args[0][1].endswith("/pickups/PRG1"))
+        self.assertFalse(picking.dhl_dispatch_confirmation)
+        self.assertIn("MyDHL", picking.message_ids[0].body)
+
+    def test_tracking_link_and_refresh(self):
+        picking = self._picking()
+        self._ship(picking)
         picking.carrier_tracking_ref = "1234567890"
-        self.assertIn("1234567890", self.carrier.dhl_express_get_tracking_link(picking))
+        self.assertIn("tracking-id=1234567890",
+                      self.carrier.dhl_express_get_tracking_link(picking))
+        with patch.object(requests, "request", return_value=FakeResponse(payload={
+            "shipments": [{"status": "Success", "events": [
+                {"date": "2026-10-03", "time": "09:00:00", "description": "Coletado"},
+                {"date": "2026-10-04", "time": "14:00:00", "description": "Em trânsito"},
+            ]}],
+        })):
+            picking.action_dhl_refresh_tracking()
+        self.assertEqual(picking.dhl_tracking_status, "Em trânsito")

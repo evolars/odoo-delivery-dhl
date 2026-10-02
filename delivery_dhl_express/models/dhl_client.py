@@ -1,33 +1,40 @@
 """Cliente HTTP da MyDHL API (DHL Express).
 
-Sem acoplamento com o Odoo: recebe credencial explicitamente e devolve
-dicionários, para poder ser testado sem banco.
+Sem acoplamento com registros do Odoo: recebe credencial explicitamente e
+devolve dicionários, para poder ser testado sem banco. O `env` é opcional e só
+serve para traduzir as mensagens fora de uma requisição HTTP.
 
-Autenticação é BasicAuth com a chave e o segredo que o consultor da DHL
-fornece. O ambiente de teste tem limite de 500 chamadas por dia.
+Autenticação é Basic Auth com a chave e o segredo do portal do desenvolvedor
+da DHL. Toda chamada leva o header `x-version` (obrigatório na especificação).
+O ambiente de teste tem limite de 500 chamadas por dia.
+
+Referência: especificação OpenAPI da MyDHL API 3.3.2 (06/09/2026), conferida
+em 02/10/2026.
 """
 import base64
 import logging
-import math
+import uuid
 
 import requests
 
-from odoo import _
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
 PRODUCTION_URL = "https://express.api.dhl.com/mydhlapi"
 TEST_URL = "https://express.api.dhl.com/mydhlapi/test"
+API_VERSION = "3.3.2"
 DEFAULT_TIMEOUT = 45
+# A cotação roda no checkout, com o comprador esperando.
+RATE_TIMEOUT = 15
 
 # A DHL usa Incoterms na declaração aduaneira. DAP é o vigente para "o
-# destinatário paga impostos na entrega" — DDU é o termo antigo, ainda aceito.
+# destinatário paga impostos na entrega" — DDU é o termo antigo.
 INCOTERM_DAP = "DAP"
 INCOTERM_DDP = "DDP"
 
-# Livro impresso. Serve de padrão quando o produto não tem código próprio.
-DEFAULT_HS_CODE = "4901"
+# Na cotação a DHL devolve o preço em até três moedas; a faturada é a BILLC.
+BILLING_CURRENCY = "BILLC"
 
 
 class DhlError(UserError):
@@ -39,15 +46,28 @@ class DhlError(UserError):
         self.payload = payload or {}
 
 
+def _untranslated(source, *args, **kwargs):
+    if args or kwargs:
+        return source % (args or kwargs)
+    return source
+
+
+def tax_id(value):
+    """CPF/CNPJ/VAT sem máscara. Mantém letras: o CNPJ alfanumérico vale desde
+    julho de 2026, e VAT europeu começa pelo país."""
+    return "".join(char for char in (value or "") if char.isalnum()).upper()
+
+
 class DhlClient:
     def __init__(self, api_key, api_secret, account_number, test_mode=True,
-                 timeout=DEFAULT_TIMEOUT):
+                 timeout=DEFAULT_TIMEOUT, env=None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.account_number = account_number
         self.test_mode = test_mode
         self.timeout = timeout
         self.base_url = TEST_URL if test_mode else PRODUCTION_URL
+        self._ = env._ if env is not None else _untranslated
 
     # ------------------------------------------------------------------ #
     # Transporte                                                          #
@@ -55,25 +75,29 @@ class DhlClient:
 
     def _headers(self):
         if not (self.api_key and self.api_secret):
-            raise DhlError(_("Configure a chave e o segredo da API da DHL Express."))
+            raise DhlError(self._("Configure a chave e o segredo da API da DHL Express."))
         credencial = base64.b64encode(
             ("%s:%s" % (self.api_key, self.api_secret)).encode()
         ).decode()
         return {
             "Authorization": "Basic %s" % credencial,
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-version": API_VERSION,
+            "Message-Reference": str(uuid.uuid4()),
         }
 
-    def request(self, method, path, payload=None, params=None):
+    def request(self, method, path, payload=None, params=None, timeout=None):
+        headers = self._headers()
         url = "%s/%s" % (self.base_url, path.lstrip("/"))
         try:
             response = requests.request(
-                method, url, headers=self._headers(), json=payload, params=params,
-                timeout=self.timeout,
+                method, url, headers=headers, json=payload, params=params,
+                timeout=timeout or self.timeout,
             )
         except requests.RequestException as error:
             _logger.warning("DHL: falha de conexão em %s %s: %s", method, path, error)
-            raise DhlError(_("Não foi possível conectar à DHL Express.")) from error
+            raise DhlError(self._("Não foi possível conectar à DHL Express.")) from error
 
         try:
             data = response.json() if response.content else {}
@@ -81,120 +105,82 @@ class DhlClient:
             data = {}
 
         if not response.ok:
-            # A DHL responde no formato RFC 7807, e detalha o campo recusado em
-            # additionalDetails — que costuma ser o que realmente ajuda.
-            detalhes = data.get("additionalDetails") or []
-            mensagem = "; ".join(str(d) for d in detalhes) if detalhes else ""
-            mensagem = mensagem or data.get("detail") or data.get("title") or response.reason
-            _logger.warning("DHL: recusa status=%s em %s %s", response.status_code, method, path)
+            mensagem = self._error_detail(data) or response.reason
+            _logger.warning("DHL: recusa status=%s em %s %s: %s",
+                            response.status_code, method, path, mensagem)
             raise DhlError(
-                _("A DHL recusou a operação: %s") % mensagem,
+                self._("A DHL recusou a operação: %s", mensagem),
                 status_code=response.status_code, payload=data,
             )
         return data
+
+    @staticmethod
+    def _error_detail(data):
+        """A DHL responde no formato da RFC 7807 e detalha o campo recusado em
+        `additionalDetails`, que é o que realmente ajuda."""
+        if not isinstance(data, dict):
+            return ""
+        principal = data.get("detail") or data.get("message") or data.get("title") or ""
+        detalhes = [str(item) for item in data.get("additionalDetails") or [] if item]
+        return " — ".join(parte for parte in [principal] + detalhes if parte)
 
     # ------------------------------------------------------------------ #
     # Operações                                                           #
     # ------------------------------------------------------------------ #
 
     def rates(self, payload):
-        """Cotação multi-volume. `POST /rates` aceita o corpo completo."""
-        return self.request("POST", "/rates", payload=payload)
+        """Cotação multivolume (`POST /rates`)."""
+        return self.request("POST", "/rates", payload=payload, timeout=RATE_TIMEOUT)
 
     def create_shipment(self, payload):
+        if not self.account_number:
+            raise DhlError(self._("Configure o número da conta DHL."))
         return self.request("POST", "/shipments", payload=payload)
 
     def track(self, tracking_number):
         return self.request(
             "GET", "/shipments/%s/tracking" % tracking_number,
-            params={"trackingView": "all-checkpoints", "levelOfDetail": "all"},
+            params={"trackingView": "all-checkpoints", "levelOfDetail": "shipment"},
         )
 
-    def ping(self):
-        """Valida a credencial com a chamada mais barata: lista de produtos."""
-        return self.request("GET", "/products", params={
-            "accountNumber": self.account_number or "",
-        })
+    def cancel_pickup(self, dispatch_confirmation_number, requestor, reason):
+        """Cancela a coleta agendada. O conhecimento em si não tem cancelamento
+        na API."""
+        return self.request(
+            "DELETE", "/pickups/%s" % dispatch_confirmation_number,
+            params={"requestorName": requestor[:35], "reason": reason[:35]},
+        )
+
+    def validate_address(self, kind, country_code, postal_code=None, city_name=None):
+        """`GET /address-validate`: a chamada mais barata que exige credencial
+        válida. Serve de teste de conexão e confere se a DHL atende o endereço."""
+        params = {"type": kind, "countryCode": country_code}
+        if postal_code:
+            params["postalCode"] = postal_code
+        if city_name:
+            params["cityName"] = city_name
+        return self.request("GET", "/address-validate", params=params)
 
 
 # --------------------------------------------------------------------------- #
-# Montagem de payload                                                          #
+# Leitura de resposta                                                          #
 # --------------------------------------------------------------------------- #
-
-def address_payload(partner):
-    """Endereço no formato que a cotação da DHL espera.
-
-    Cidade, país e CEP bastam para cotar; o endereço completo só é exigido na
-    criação do envio.
-    """
-    if not partner.country_id:
-        raise DhlError(_(
-            "Informe o país de %s: a DHL cota por país de destino.",
-            partner.display_name,
-        ))
-    payload = {
-        "countryCode": partner.country_id.code,
-        "cityName": (partner.city or "")[:45],
-    }
-    if partner.zip:
-        payload["postalCode"] = partner.zip.replace("-", "").replace(".", "").strip()
-    if partner.state_id and partner.state_id.code:
-        payload["provinceCode"] = partner.state_id.code
-    return payload
-
-
-def package_payload(weight_kg, length_cm, width_cm, height_cm):
-    """Um volume. A DHL aceita decimal, mas recusa zero."""
-    return {
-        "weight": round(max(weight_kg or 0.0, 0.01), 3),
-        "dimensions": {
-            "length": max(int(math.ceil(length_cm or 0)), 1),
-            "width": max(int(math.ceil(width_cm or 0)), 1),
-            "height": max(int(math.ceil(height_cm or 0)), 1),
-        },
-    }
-
-
-def rate_payload(shipper, receiver, packages, planned_date, account_number,
-                 declared_value=0.0, currency="BRL", customs_declarable=True):
-    """Corpo de `POST /rates`.
-
-    `plannedShippingDateAndTime` precisa do offset explícito — a DHL recusa o
-    formato sem fuso.
-    """
-    payload = {
-        "customerDetails": {"shipperDetails": shipper, "receiverDetails": receiver},
-        "plannedShippingDateAndTime": planned_date,
-        "unitOfMeasurement": "metric",
-        "isCustomsDeclarable": customs_declarable,
-        "packages": packages,
-    }
-    if account_number:
-        payload["accounts"] = [{"typeCode": "shipper", "number": account_number}]
-    if declared_value:
-        payload["monetaryAmount"] = [{
-            "typeCode": "declaredValue",
-            "value": round(declared_value, 2),
-            "currency": currency.upper(),
-        }]
-    return payload
-
 
 def extract_products(response):
     """Normaliza as opções de serviço devolvidas pela cotação."""
     produtos = []
     for produto in response.get("products") or []:
         precos = produto.get("totalPrice") or []
-        # a DHL devolve o preço em mais de uma moeda; a faturada é BILLC
         escolhido = next(
-            (p for p in precos if (p.get("currencyType") or "").upper() == "BILLC"),
+            (p for p in precos if (p.get("currencyType") or "").upper() == BILLING_CURRENCY),
             precos[0] if precos else None,
         )
-        if not escolhido:
+        if not escolhido or escolhido.get("price") in (None, ""):
             continue
-        entrega = (produto.get("deliveryCapabilities") or {})
+        entrega = produto.get("deliveryCapabilities") or {}
         produtos.append({
             "code": produto.get("productCode"),
+            "local_code": produto.get("localProductCode"),
             "name": produto.get("productName") or produto.get("productCode"),
             "price": float(escolhido.get("price") or 0.0),
             "currency": escolhido.get("priceCurrency"),

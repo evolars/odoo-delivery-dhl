@@ -19,15 +19,17 @@
                                     icon="fa-plug" colspan="2"
                                     invisible="dhl_simulation"/>
                             <div colspan="2" class="text-muted">
-                                Fora de produção as chamadas vão para o sandbox, que
-                                tem limite de 500 por dia.
+                                O ambiente segue o campo <i>Ambiente</i> acima: fora de
+                                produção as chamadas vão para o ambiente de teste da DHL,
+                                que tem limite de 500 por dia.
                             </div>
                         </group>
                         <group string="Serviço">
                             <field name="dhl_product_code" placeholder="vazio = mais barato"/>
                             <field name="dhl_incoterm"/>
-                            <field name="dhl_default_package_type_id"/>
+                            <field name="dhl_international_only"/>
                             <field name="dhl_lead_days"/>
+                            <field name="dhl_default_hs_code" placeholder="490199"/>
                         </group>
                     </group>
                     <group>
@@ -35,9 +37,25 @@
                              invisible="dhl_incoterm != 'DAP'">
                             Com <b>DAP</b>, o destinatário paga imposto de importação e
                             desembaraço na entrega. Isso <b>precisa</b> aparecer no
-                            checkout: sem aviso, o comprador é surpreendido e recusa o
-                            pacote, que volta por conta do remetente.
+                            checkout: o Odoo mostra a <i>Descrição</i> do método (aba de
+                            descrição no site), não o aviso da cotação. Sem aviso, o
+                            comprador recusa o pacote, que volta por conta do remetente.
                         </div>
+                    </group>
+                    <group>
+                        <group string="Embalagem e documentos">
+                            <field name="dhl_package_type_ids" widget="many2many_tags"/>
+                            <field name="dhl_default_package_type_id"/>
+                            <field name="dhl_label_template"/>
+                            <field name="dhl_commercial_invoice"/>
+                        </group>
+                        <group string="Coleta">
+                            <field name="dhl_request_pickup"/>
+                            <field name="dhl_pickup_close_time" placeholder="18:00"
+                                   invisible="not dhl_request_pickup"/>
+                            <field name="dhl_pickup_location"
+                                   invisible="not dhl_request_pickup"/>
+                        </group>
                     </group>
                     <group string="Antes da conta existir">
                         <field name="dhl_simulation"/>
@@ -45,6 +63,23 @@
                                invisible="not dhl_simulation"/>
                     </group>
                 </page>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="view_picking_form_dhl" model="ir.ui.view">
+        <field name="name">stock.picking.form.dhl.express</field>
+        <field name="model">stock.picking</field>
+        <field name="inherit_id" ref="stock_delivery.view_picking_withcarrier_out_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="/form/header/button[last()]" position="after">
+                <button name="action_dhl_refresh_tracking" type="object"
+                        string="Atualizar rastreio"
+                        invisible="delivery_type != 'dhl_express' or not carrier_tracking_ref"/>
+            </xpath>
+            <xpath expr="//field[@name='carrier_tracking_ref']" position="after">
+                <field name="dhl_tracking_status" readonly="1" class="oe_inline ms-2 text-muted"
+                       invisible="not dhl_tracking_status"/>
             </xpath>
         </field>
     </record>
