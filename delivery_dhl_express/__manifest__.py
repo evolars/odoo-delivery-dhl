@@ -1,6 +1,6 @@
 {
     "name": "DHL Express - Frete Internacional",
-    "version": "18.0.1.0.0",
+    "version": "18.0.1.1.0",
     "category": "Inventory/Delivery",
     "summary": "Cotação, envio, etiqueta e rastreamento pela MyDHL API",
     "description": """

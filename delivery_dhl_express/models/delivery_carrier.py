@@ -113,9 +113,10 @@ class DeliveryCarrier(models.Model):
     dhl_simulation_price = fields.Float(string="Preço simulado", default=180.0)
     dhl_require_nfe = fields.Boolean(
         string="Exigir NF-e autorizada", default=True,
-        help="Remetente brasileiro com Inscrição Estadual só exporta com NF-e: a DHL "
-             "Brasil exige a nota no despacho, e a Receita cruza a nota com a fatura "
-             "comercial. Ligado, a entrega não é despachada sem NF-e autorizada na venda.",
+        help="Remetente brasileiro com Inscrição Estadual só envia mercadoria com NF-e, "
+             "no Brasil ou para fora: a DHL Brasil exige a nota no despacho (na exportação, "
+             "a Receita cruza a nota com a fatura comercial). Ligado, a entrega não é "
+             "despachada sem NF-e autorizada na venda.",
     )
 
     # ------------------------------------------------------------------ #
@@ -528,12 +529,20 @@ class DeliveryCarrier(models.Model):
             volume["customerReferences"] = [{"value": referencia, "typeCode": "CU"}]
             volumes.append(volume)
 
-        nfe = self._dhl_nfe(picking) if internacional else False
-        if internacional and not nfe and self._dhl_requires_nfe(remetente, picking.company_id):
+        # Mercadoria de quem tem IE só circula com NF-e, dentro ou fora do país:
+        # no envio nacional a DHL emite o CT-e a partir da nota.
+        nfe = self._dhl_nfe(picking)
+        if not nfe and self._dhl_requires_nfe(remetente, picking.company_id):
+            if internacional:
+                raise DhlError(_(
+                    "Emita a NF-e de exportação da venda %s antes de despachar: a DHL Brasil "
+                    "exige a nota de quem tem Inscrição Estadual, e a Receita cruza a nota com "
+                    "a fatura comercial.", picking.sale_id.name or picking.name,
+                ))
             raise DhlError(_(
-                "Emita a NF-e de exportação da venda %s antes de despachar: a DHL Brasil "
-                "exige a nota de quem tem Inscrição Estadual, e a Receita cruza a nota com "
-                "a fatura comercial.", picking.sale_id.name or picking.name,
+                "Emita a NF-e da venda %s antes de despachar: quem tem Inscrição Estadual "
+                "só envia mercadoria com nota, e a DHL emite o CT-e a partir dela.",
+                picking.sale_id.name or picking.name,
             ))
 
         etiqueta = {"typeCode": "label",
@@ -640,7 +649,7 @@ class DeliveryCarrier(models.Model):
         return declaracao
 
     def _dhl_requires_nfe(self, remetente, company):
-        """Exportador brasileiro com IE precisa de NF-e. Sem a localização fiscal
+        """Remetente brasileiro com IE precisa de NF-e, no Brasil ou para fora. Sem a localização fiscal
         (OCA) não há como emitir nem checar a nota pelo Odoo."""
         if not self.dhl_require_nfe or remetente.country_id.code != "BR":
             return False

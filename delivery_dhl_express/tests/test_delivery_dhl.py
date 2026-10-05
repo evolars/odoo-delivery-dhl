@@ -442,6 +442,35 @@ class TestDhlShipping(DhlCarrierCase):
         self.assertEqual(declaracao["remarks"], [{"value": "NF-e %s" % self.NFE["key"]}])
         self.assertIn("DANFE", picking.message_ids[0].body)
 
+    def test_domestic_shipment_also_needs_nfe(self):
+        """No Brasil a mercadoria também só circula com nota."""
+        Carrier = self.env.registry["delivery.carrier"]
+        self.carrier.dhl_international_only = False
+        picking = self._picking(partner=self.national_buyer)
+        with patch.object(Carrier, "_dhl_requires_nfe", return_value=True), \
+                patch.object(Carrier, "_dhl_nfe", return_value=False):
+            with patch.object(requests, "request", side_effect=[
+                FakeResponse(payload={"products": [product("N", 40.0)]}),
+            ]) as call:
+                with self.assertRaises(DhlError) as caught:
+                    self.carrier.send_shipping(picking)
+        self.assertIn("NF-e", str(caught.exception))
+        self.assertNotIn("exportação", str(caught.exception))
+        self.assertEqual(call.call_count, 1, "só a cotação: o envio nem é criado")
+
+    def test_domestic_nfe_goes_on_the_label_without_customs(self):
+        Carrier = self.env.registry["delivery.carrier"]
+        self.carrier.dhl_international_only = False
+        nfe = dict(self.NFE, move=self.env["account.move"])
+        picking = self._picking(partner=self.national_buyer)
+        with patch.object(Carrier, "_dhl_nfe", return_value=nfe):
+            _result, call = self._ship(picking)
+        corpo = call.call_args_list[1][1]["json"]
+        etiqueta = corpo["outputImageProperties"]["imageOptions"][0]
+        self.assertEqual(etiqueta["labelCustomerDataText"], "NF-e %s" % self.NFE["key"])
+        self.assertFalse(corpo["content"]["isCustomsDeclarable"])
+        self.assertNotIn("exportDeclaration", corpo["content"])
+
     def test_requirement_only_applies_to_brazilian_exporter_with_ie(self):
         remetente = self.env.company.partner_id
         self.carrier.dhl_require_nfe = False

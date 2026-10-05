@@ -129,6 +129,10 @@ fiscal (sem nota, só isento de IE ou pessoa física), e a Receita cruza a NF-e 
 comercial. Com *Exigir NF-e autorizada* (padrão), remetente brasileiro com IE **não despacha
 sem NF-e autorizada na venda** (localização fiscal OCA): a validação da entrega mostra o aviso.
 
+O mesmo vale para o **envio nacional** (DHL Express Nacional): mercadoria de quem tem IE só
+circula com NF-e, e a DHL emite o CT-e a partir dela. A nota é exigida e a chave vai na
+etiqueta, sem declaração aduaneira nem fatura comercial.
+
 A MyDHL API não tem campo de NF-e (conferido até a 3.3.2: o único tratamento brasileiro é o
 `CNP` no remetente). A nota vai por todos os meios que a API oferece:
 
