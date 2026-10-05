@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import requests
 
+from odoo import fields
 from odoo.exceptions import UserError
 from odoo.tests import TransactionCase, tagged
 
@@ -490,3 +491,45 @@ class TestDhlShipping(DhlCarrierCase):
         })):
             picking.action_dhl_refresh_tracking()
         self.assertEqual(picking.dhl_tracking_status, "Em trânsito")
+        self.assertEqual([e["description"] for e in picking.dhl_tracking_events],
+                         ["Em trânsito", "Coletado"], "do mais recente ao mais antigo")
+        self.assertFalse(picking.dhl_delivered)
+
+    def test_events_are_translated_and_delivery_closes_the_tracking(self):
+        picking = self._picking()
+        self._ship(picking)
+        picking.write({"carrier_tracking_ref": "1234567890", "state": "done",
+                       "date_done": fields.Datetime.now()})
+        resposta = FakeResponse(payload={"shipments": [{"events": [
+            {"date": "2026-10-03", "time": "09:00:00", "typeCode": "PU",
+             "description": "Shipment picked up",
+             "serviceArea": [{"code": "FLN", "description": "Florianopolis-BR"}]},
+            {"date": "2026-10-06", "time": "11:20:00", "typeCode": "OK",
+             "description": "Delivered", "serviceArea": [{"description": "Sao Paulo-BR"}]},
+            {"date": "2026-10-05", "time": "08:00:00", "typeCode": "XX",
+             "description": "Something new"},
+        ]}]})
+        with patch.object(requests, "request", return_value=resposta) as call:
+            self.env["stock.picking"]._cron_dhl_refresh_tracking()
+        self.assertEqual(call.call_count, 1)
+        eventos = picking.dhl_tracking_events
+        self.assertEqual(eventos[0], {"date": "2026-10-06", "time": "11:20", "code": "OK",
+                                      "description": "Entregue", "location": "Sao Paulo-BR"})
+        self.assertEqual(eventos[1]["description"], "Something new",
+                         "evento sem tradução fica como a DHL escreveu")
+        self.assertEqual(eventos[2]["location"], "Florianopolis-BR")
+        self.assertTrue(picking.dhl_delivered)
+        self.assertEqual(picking.dhl_tracking_status, "Entregue")
+        with patch.object(requests, "request") as call:
+            self.env["stock.picking"]._cron_dhl_refresh_tracking()
+        call.assert_not_called()
+
+    def test_cron_survives_a_dhl_refusal(self):
+        picking = self._picking()
+        self._ship(picking)
+        picking.write({"carrier_tracking_ref": "1234567890", "state": "done",
+                       "date_done": fields.Datetime.now()})
+        with patch.object(requests, "request", return_value=FakeResponse(
+                status_code=404, payload={"detail": "not found"}, reason="Not Found")):
+            self.env["stock.picking"]._cron_dhl_refresh_tracking()
+        self.assertFalse(picking.dhl_tracking_events)

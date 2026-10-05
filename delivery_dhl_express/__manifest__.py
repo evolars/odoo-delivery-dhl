@@ -1,6 +1,6 @@
 {
     "name": "DHL Express - Frete Internacional",
-    "version": "18.0.1.1.0",
+    "version": "18.0.1.2.0",
     "category": "Inventory/Delivery",
     "summary": "Cotação, envio, etiqueta e rastreamento pela MyDHL API",
     "description": """
@@ -12,7 +12,9 @@ Community é o `delivery_mondialrelay`. Por isso este módulo **não se chama
 `delivery_dhl`**: numa base com Enterprise o nome colidiria.
 
 Cobre cotação, criação de envio com etiqueta, fatura comercial e declaração
-aduaneira, coleta opcional e rastreamento.
+aduaneira, coleta opcional e rastreamento. Os eventos do rastreio ficam na entrega
+(`dhl_tracking_events`) e uma tarefa agendada os atualiza a cada 3 horas até
+a entrega, para o portal do cliente mostrar o caminho do pacote.
 
 **Incoterm.** O padrão é `DAP`: o destinatário paga imposto de importação e
 desembaraço na entrega. O checkout do Odoo 18 não mostra o aviso da cotação:
@@ -27,7 +29,10 @@ poder ser exercitado antes de a conta DHL existir. Despachar fica bloqueado.
     "license": "AGPL-3",
     "depends": ["stock_delivery"],
     "external_dependencies": {"python": ["requests"]},
-    "data": ["views/delivery_dhl_views.xml"],
+    "data": [
+        "data/ir_cron.xml",
+        "views/delivery_dhl_views.xml",
+    ],
     "installable": True,
     "application": False,
 }
